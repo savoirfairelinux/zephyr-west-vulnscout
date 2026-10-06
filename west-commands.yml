@@ -1,0 +1,6 @@
+west-commands:
+  - file: scripts/west_commands/vulnscout.py
+    commands:
+      - name: vulnscout
+        class: ZephyrVulnScout
+        help: generate SPDX3 SBOMs and import them into VulnScout
