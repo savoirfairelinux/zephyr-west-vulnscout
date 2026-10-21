@@ -90,6 +90,9 @@ class ZephyrVulnScout(WestCommand):
                 # Export stored data as SPDX 2.3:
                 west vulnscout export -d build --format spdx2
 
+                # Exit with code 2 if a critical vulnerability is found:
+                west vulnscout -d build --match-condition "cvss >= 9.0"
+
                 # Request SPDX 3.1 explicitly (requires spdx-python-model v3_1):
                 west vulnscout -d build --spdx-version 3.1
             """
@@ -213,7 +216,7 @@ class ZephyrVulnScout(WestCommand):
         )
         parser.add_argument(
             '--match-condition',
-            help='pass --match-condition to VulnScout',
+            help='evaluate a vulnerability condition (exit 2 if matched, 0 if not, 1 on error)',
         )
         parser.add_argument(
             '--template',
@@ -251,6 +254,11 @@ class ZephyrVulnScout(WestCommand):
         if args.action == 'stop' or args.stop:
             self._stop_vulnscout_container(args)
             return
+
+        if args.match_condition is not None and not args.match_condition.strip():
+            self.die('--match-condition must not be empty')
+        if args.match_condition and args.serve:
+            self.die('--match-condition cannot be combined with --serve')
 
         if not args.build_dir:
             self.die('Build directory not specified; call `west vulnscout --build-dir=BUILD_DIR`')
@@ -293,7 +301,7 @@ class ZephyrVulnScout(WestCommand):
         data_dir = self._resolve_vulnscout_data_dir(args, build_dir)
 
         try:
-            self._run_vulnscout(args, spdx_files, data_dir)
+            exit_code = self._run_vulnscout(args, spdx_files, data_dir)
         except KeyboardInterrupt:
             if args.serve and not args.vulnscout_cmd:
                 self.wrn('Interrupted by user; stopping VulnScout container')
@@ -303,6 +311,8 @@ class ZephyrVulnScout(WestCommand):
 
         if args.stop_after_run:
             self._stop_vulnscout_container(args)
+        if exit_code == 2:
+            raise SystemExit(2)
 
     def _resolve_container_engine(self, preferred):
         if preferred in ('docker', 'podman'):
@@ -829,4 +839,7 @@ class ZephyrVulnScout(WestCommand):
                 f'Use --vulnscout-cmd with an absolute path, or use direct exec mode.'
             )
         except subprocess.CalledProcessError as e:
+            if args.match_condition and e.returncode == 2:
+                return 2
             self.die(f'VulnScout failed with exit code {e.returncode}')
+        return 0

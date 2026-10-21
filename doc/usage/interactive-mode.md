@@ -94,3 +94,7 @@ a shared container without coordinating with its other users.
 `--serve` cannot be combined with `--stop-after-run`. See
 [Container Lifecycle and Configuration](container-configuration.md) for explicit
 stop commands and wrapper mode.
+
+`--serve` also cannot be combined with `--match-condition`; run a separate
+[Monitor Vulnerabilities](monitor-vulnerabilities.md) command for CI policy
+evaluation.

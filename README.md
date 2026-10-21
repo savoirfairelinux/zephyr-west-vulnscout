@@ -125,6 +125,24 @@ Always pass the same `--project` and `--variant` when continuing a workflow.
 Omitting them selects `default/default`; `--serve` alone still generates and
 imports an SBOM rather than acting as a view-only command.
 
+### Monitor vulnerabilities
+
+Evaluate a vulnerability policy after importing the SBOM:
+
+```sh
+west vulnscout -d demo/mbedtls_sbom/build \
+  --container-engine podman \
+  --project zephyr_demo --variant mbedtls_native_sim \
+  --match-condition 'cvss >= 9.0 and (pending or affected)'
+```
+
+Exit codes distinguish no match (`0`), execution errors (`1`), and a policy
+match (`2`). Add `--perform-scan` to request all scanners before evaluation.
+Conditions use stored metadata unless it is explicitly refreshed, and cannot
+be combined with `--serve`.
+See [Monitor Vulnerabilities](doc/usage/monitor-vulnerabilities.md) for tokens,
+examples, scope, refresh behavior, and CI integration.
+
 ### Generate a report
 
 After importing and scanning a project, generate a report from its stored data:

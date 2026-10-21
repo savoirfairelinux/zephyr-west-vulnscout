@@ -303,6 +303,109 @@ class VulnScoutCommandTests(unittest.TestCase):
                 '--refresh-vulnerability-data',
             ])
 
+    def test_match_condition_forwarding_and_exit_status(self):
+        condition = '(cvss >= 9.0 or epss >= 50%) and (pending or affected)'
+        for wrapper in [False, True]:
+            for status in [0, 1, 2]:
+                with (
+                    self.subTest(wrapper=wrapper, status=status),
+                    patch.object(self.command, '_resolve_container_engine', return_value='podman'),
+                    patch.object(self.command, '_ensure_container_running'),
+                    patch.object(self.command, 'die', side_effect=fail),
+                    patch.object(vulnscout.subprocess, 'run') as run,
+                ):
+                    options = ['--match-condition', condition, '--project', 'zephyr', '--variant', 'native']
+                    if wrapper:
+                        options.extend(['--vulnscout-cmd', '/demo/vulnscout'])
+                    args = self.parse(*options)
+                    if status:
+                        run.side_effect = subprocess.CalledProcessError(status, 'vulnscout')
+                    if status == 1:
+                        with self.assertRaisesRegex(RuntimeError, 'exit code 1'):
+                            self.command._run_vulnscout(args, [], '/cache')
+                    else:
+                        self.assertEqual(self.command._run_vulnscout(args, [], '/cache'), status)
+                    command = run.call_args.args[0]
+                    self.assertEqual(command[-2:], ['--match-condition', condition])
+                    self.assertIn('zephyr', command)
+                    self.assertIn('native', command)
+
+    def test_exit_two_without_a_match_condition_is_an_error(self):
+        with (
+            patch.object(self.command, '_resolve_container_engine', return_value='podman'),
+            patch.object(self.command, '_ensure_container_running'),
+            patch.object(self.command, 'die', side_effect=fail),
+            patch.object(vulnscout.subprocess, 'run', side_effect=subprocess.CalledProcessError(2, 'vulnscout')),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'exit code 2'):
+                self.command._run_vulnscout(self.parse(), [], '/cache')
+
+    def test_refresh_condition_skips_import_and_stops_before_propagating_matches(self):
+        with tempfile.TemporaryDirectory() as build_dir:
+            for status in [0, 2]:
+                for stop_requested in [False, True]:
+                    with self.subTest(status=status, stop=stop_requested):
+                        options = [
+                            '-d', build_dir, '--refresh-vulnerability-data',
+                            '--match-condition', 'cvss >= 9.0',
+                        ]
+                        if stop_requested:
+                            options.append('--stop-after-run')
+                        args = self.parse(*options)
+                        with (
+                            patch.object(self.command, '_run_west_spdx') as generate,
+                            patch.object(self.command, '_resolve_spdx_files') as resolve,
+                            patch.object(self.command, '_run_vulnscout', return_value=status) as scan,
+                            patch.object(self.command, '_stop_vulnscout_container') as stop,
+                        ):
+                            if status == 2:
+                                with self.assertRaises(SystemExit) as caught:
+                                    self.command.do_run(args, [])
+                                self.assertEqual(caught.exception.code, 2)
+                            else:
+                                self.command.do_run(args, [])
+                        generate.assert_not_called()
+                        resolve.assert_not_called()
+                        scan.assert_called_once_with(
+                            args, [], self.command._resolve_vulnscout_data_dir(args, build_dir),
+                        )
+                        if stop_requested:
+                            stop.assert_called_once_with(args)
+                        else:
+                            stop.assert_not_called()
+
+    def test_import_with_condition_preserves_generation_and_match_exit(self):
+        with tempfile.TemporaryDirectory() as build_dir:
+            args = self.parse('-d', build_dir, '--match-condition', 'pending')
+            files = [str(pathlib.Path(build_dir) / 'spdx' / 'app.jsonld')]
+            with (
+                patch.object(self.command, '_run_west_spdx') as generate,
+                patch.object(self.command, '_resolve_spdx_files', return_value=files),
+                patch.object(self.command, '_run_vulnscout', return_value=2) as scan,
+            ):
+                with self.assertRaises(SystemExit) as caught:
+                    self.command.do_run(args, [])
+                self.assertEqual(caught.exception.code, 2)
+            generate.assert_called_once()
+            self.assertEqual(scan.call_args.args[1], files)
+
+    def test_empty_conditions_and_serve_are_rejected_before_generation(self):
+        cases = [
+            ['--match-condition', ''], ['--match-condition', '   '],
+            ['--match-condition', 'pending', '--serve'],
+        ]
+        for options in cases:
+            with (
+                self.subTest(options=options),
+                patch.object(self.command, 'die', side_effect=fail),
+                patch.object(self.command, '_run_west_spdx') as generate,
+                patch.object(self.command, '_run_vulnscout') as scan,
+            ):
+                with self.assertRaisesRegex(RuntimeError, '--match-condition'):
+                    self.command.do_run(self.parse(*options), [])
+                generate.assert_not_called()
+                scan.assert_not_called()
+
     def test_report_skips_import_and_copies_only_the_requested_report(self):
         for engine in ['podman', 'docker']:
             for output_format in [None, 'html', 'pdf']:

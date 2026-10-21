@@ -11,6 +11,7 @@ SPDX 3 SBOMs and imports them into VulnScout for vulnerability analysis.
    getting-started
    usage/sbom-generation
    usage/vulnerability-scanning
+   usage/monitor-vulnerabilities
    usage/vulnerability-data
    usage/interactive-mode
    usage/exports
