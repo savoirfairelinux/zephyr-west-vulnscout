@@ -229,3 +229,13 @@ same style as VulnScout and meta-vulnscout.
 - Read the Docs config: .readthedocs.yaml
 - Sphinx configuration: doc/conf.py
 - Sphinx entry page: doc/index.rst
+
+Build the HTML documentation from this repository's root:
+
+```sh
+python -m pip install -r doc/requirements.txt
+python -m sphinx -a -b html doc doc/_build/html
+```
+
+Open `doc/_build/html/index.html`. The `-a` option rewrites every HTML page so
+sidebar menus stay consistent after changing the documentation navigation.
