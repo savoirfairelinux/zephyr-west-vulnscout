@@ -11,6 +11,9 @@ into VulnScout for vulnerability analysis.
   - Uses direct `docker exec`/`podman exec` by default
   - Supports optional VulnScout flags like `--serve` and `--dev`
   - Supports optional wrapper mode via `--vulnscout-cmd`
+- `west vulnscout report`
+  - Generates reports from stored results without importing or rescanning
+  - Copies the selected report from the container to a host directory
 
 ## Repository layout
 
@@ -110,6 +113,59 @@ an SBOM, scan it, and enrich the newly encountered vulnerabilities instead.
 Always pass the same `--project` and `--variant` when continuing a workflow.
 Omitting them selects `default/default`; `--serve` alone still generates and
 imports an SBOM rather than acting as a view-only command.
+
+### Generate a report
+
+After importing and scanning a project, generate a report from its stored data:
+
+```sh
+west vulnscout report -d demo/mbedtls_sbom/build \
+  --container-engine podman \
+  --project zephyr_demo --variant mbedtls_native_sim \
+  --template summary.adoc --format html \
+  --output-dir demo/mbedtls_sbom/reports
+```
+
+This writes `summary.adoc.html` on the host. Use `--format pdf` for
+`summary.adoc.pdf`, or omit `--format` to retain the template's native format.
+The default template is `summary.adoc`; other installed templates include
+`all_assessments.adoc`. Templates must be installed names, not host paths.
+Conversion to HTML/PDF requires an `.adoc` template and the corresponding
+conversion tools in the VulnScout image.
+
+The default output directory is `<build-dir>/vulnscout-reports`. The build
+directory selects the same persistent cache as a scan; no SPDX files are needed.
+Use the same `--project`, `--variant`, and, if applicable,
+`--vulnscout-data-dir` as the original import. Reporting refuses a container
+mounted to a different cache rather than exporting another database.
+
+Reports use direct Docker/Podman mode; `--vulnscout-cmd` is not supported for this
+action. A running web server is reused without restarting it. The command does
+not generate/import SBOMs, refresh vulnerability data, or run scanners, and
+rejects options requesting those operations. `--stop-after-run` remains
+available. An unavailable report command, template, or converter causes an
+error instead of returning an old output file.
+
+For a custom Jinja2/AsciiDoc template named `my-report.adoc`, install it in the
+container's persistent template directory first:
+
+```sh
+podman exec vulnscout mkdir -p /cache/vulnscout/templates
+podman cp my-report.adoc vulnscout:/cache/vulnscout/templates/my-report.adoc
+```
+
+Then select it by filename. Replace `/path/to/existing/cache` with the host
+directory mounted at `/cache/vulnscout` in that container:
+
+```sh
+west vulnscout report -d demo/mbedtls_sbom/build \
+  --container-engine podman \
+  --vulnscout-data-dir /path/to/existing/cache \
+  --project zephyr_demo --variant mbedtls_native_sim \
+  --template my-report.adoc --format html --output-dir reports
+```
+
+The generated report is `reports/my-report.adoc.html`.
 
 To stop the VulnScout container cleanly after task completion:
 

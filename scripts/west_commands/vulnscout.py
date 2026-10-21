@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import textwrap
 import time
+import uuid
 
 from west.commands import WestCommand
 from west.util import quote_sh_list
@@ -32,7 +33,10 @@ By default this command runs `west spdx --spdx-version 3.0`, then imports all
 `*.jsonld` files from the SPDX output directory into VulnScout using
 `--add-spdx` via `docker exec` or `podman exec`. In direct mode it mounts
 `<build-dir>/../.vulnscout/cache` to `/cache/vulnscout` for persistent database
-storage."""
+storage.
+
+Use `west vulnscout report` to generate a report from the existing database
+and copy it to the host without importing or scanning again."""
 
 
 class ZephyrVulnScout(WestCommand):
@@ -64,6 +68,9 @@ class ZephyrVulnScout(WestCommand):
                 # Stop the VulnScout container and exit:
                 west vulnscout stop
 
+                # Generate a report from the existing database:
+                west vulnscout report -d build --format html
+
                 # Request SPDX 3.1 explicitly (requires spdx-python-model v3_1):
                 west vulnscout -d build --spdx-version 3.1
             """
@@ -73,8 +80,8 @@ class ZephyrVulnScout(WestCommand):
         parser.add_argument(
             'action',
             nargs='?',
-            choices=['stop'],
-            help='stop the VulnScout container and exit (alias for --stop)',
+            choices=['stop', 'report'],
+            help='stop the container, or generate a report from stored results',
         )
         parser.add_argument('-d', '--build-dir', help='Zephyr build directory')
         parser.add_argument(
@@ -189,12 +196,30 @@ class ZephyrVulnScout(WestCommand):
             '--match-condition',
             help='pass --match-condition to VulnScout',
         )
+        parser.add_argument(
+            '--template',
+            help='report template name already installed in VulnScout (default: summary.adoc)',
+        )
+        parser.add_argument(
+            '--format',
+            choices=['html', 'pdf'],
+            help='convert an AsciiDoc report to HTML or PDF (default: template format)',
+        )
+        parser.add_argument(
+            '--output-dir',
+            help='host report directory (default: <build-dir>/vulnscout-reports)',
+        )
 
         return parser
 
     def do_run(self, args, unknown_args):
         if unknown_args:
             self.die(f'Unexpected arguments: {unknown_args}')
+
+        if args.action != 'report' and any((args.template, args.format, args.output_dir)):
+            self.die('--template, --format, and --output-dir require `west vulnscout report`')
+        if args.action == 'report' and args.stop:
+            self.die('report cannot be combined with --stop')
 
         if args.action == 'stop' or args.stop:
             self._stop_vulnscout_container(args)
@@ -208,6 +233,12 @@ class ZephyrVulnScout(WestCommand):
 
         if not os.path.isdir(build_dir):
             self.die(f'Build directory does not exist: {build_dir}')
+
+        if args.action == 'report':
+            self._run_report(args, build_dir)
+            if args.stop_after_run:
+                self._stop_vulnscout_container(args)
+            return
 
         if args.serve and args.stop_after_run:
             self.die(
@@ -255,6 +286,68 @@ class ZephyrVulnScout(WestCommand):
                 return candidate
 
         self.die('Could not find podman or docker in PATH')
+
+    def _run_report(self, args, build_dir):
+        if args.vulnscout_cmd:
+            self.die('report uses direct container mode; omit --vulnscout-cmd')
+        if any((
+            args.perform_scan, args.refresh_vulnerability_data, args.serve, args.dev,
+            args.match_condition, args.spdx_file, args.spdx_dir, args.no_generate,
+            args.include_sdk, args.analyze_includes, args.namespace_prefix,
+            args.spdx_version != '3.0',
+        )):
+            self.die('report cannot be combined with scan, import, refresh, or serve options')
+        template = args.template if args.template is not None else 'summary.adoc'
+        if not template or template in ('.', '..') or pathlib.PurePosixPath(template).name != template:
+            self.die('--template must be an installed template filename, not a path')
+        if args.format and not template.endswith('.adoc'):
+            self.die('--format requires an AsciiDoc (.adoc) template')
+
+        engine = self._resolve_container_engine(args.container_engine)
+        data_dir = self._resolve_vulnscout_data_dir(args, build_dir)
+        self._ensure_container_running(engine, args.container_name, args, data_dir)
+        mounted_dir = self._get_container_data_mount(engine, args.container_name)
+        if not mounted_dir or os.path.realpath(mounted_dir) != os.path.realpath(data_dir):
+            self.die(
+                'Report container must mount the selected cache at /cache/vulnscout. '
+                'Select the matching --container-name or --vulnscout-data-dir.'
+            )
+
+        report_dir = f'/tmp/vulnscout_report_{uuid.uuid4().hex}'
+        filename = template + (f'.{args.format}' if args.format else '')
+        output_dir = os.path.abspath(
+            args.output_dir or os.path.join(build_dir, 'vulnscout-reports')
+        )
+        output_path = os.path.join(output_dir, filename)
+        command = [
+            engine, 'exec', '-e', 'GENERATE_DOCUMENTS=', '-w', '/scan',
+            args.container_name, 'flask', '--app', 'src.bin.webapp',
+            'report', template, '--project', args.project, '--variant', args.variant,
+            '--output-dir', report_dir,
+        ]
+        if args.format:
+            command.extend(['--format', args.format])
+        self.inf(f'Generating VulnScout report: {quote_sh_list(command)}')
+        try:
+            subprocess.run(command, check=True)
+            os.makedirs(output_dir, exist_ok=True)
+            subprocess.run([
+                engine, 'cp', f'{args.container_name}:{report_dir}/{filename}', output_path,
+            ], check=True)
+        except subprocess.CalledProcessError as e:
+            self.die(
+                f'Report generation or retrieval failed with exit code {e.returncode}. '
+                'Check the template, project/variant, and container report support.'
+            )
+        except OSError as e:
+            self.die(f'Could not write report output: {e}')
+        finally:
+            cleanup = subprocess.run([
+                engine, 'exec', args.container_name, 'rm', '-rf', '--', report_dir,
+            ], capture_output=True, text=True)
+            if cleanup.returncode:
+                self.wrn(f'Could not remove temporary report directory {report_dir}: {cleanup.stderr}')
+        self.inf(f'Report written: {output_path}')
 
     def _assert_container_running(self, engine, container_name):
         ps_cmd = [engine, 'ps', '--format', '{{.Names}}']
