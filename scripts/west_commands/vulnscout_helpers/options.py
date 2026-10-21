@@ -7,8 +7,10 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 import json
+import math
 import os
 import pathlib
+import re
 import uuid
 
 from .process import VulnScoutError
@@ -36,6 +38,26 @@ SBOM_EXPORT_FILES = {
     'cdx16': 'sbom_cyclonedx_v1_6.cdx.json',
     'openvex': 'openvex.json',
 }
+
+
+def positive_timeout(value: str) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('timeout must be a positive, finite number of seconds') from error
+    if not math.isfinite(timeout) or not 0 < timeout <= 86400:
+        raise argparse.ArgumentTypeError('timeout must be greater than 0 and at most 86400 seconds')
+    return timeout
+
+
+def spdx31_bindings_unavailable(stderr: str) -> bool:
+    patterns = (
+        r"""^AttributeError: module ['"]spdx_python_model['"] has no attribute ['"]v3_1['"](?:\..*)?$""",
+        r"""^ModuleNotFoundError: No module named ['"]spdx_python_model\.v3_1['"]$""",
+        r"""^ImportError: cannot import name ['"]v3_1['"] from ['"]spdx_python_model['"](?: .*)?$""",
+    )
+    lines = stderr.rstrip().splitlines()
+    return bool(lines) and any(re.fullmatch(pattern, lines[-1]) for pattern in patterns)
 
 
 def web_server_settings(host: str, raw_port: str) -> tuple[str, str]:

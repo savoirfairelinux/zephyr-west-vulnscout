@@ -68,5 +68,13 @@ their cross-document relationships.
 | `--include-sdk` | Include the SDK in SPDX generation. |
 | `--analyze-includes` | Analyze included header files during generation. |
 
-SPDX 3.1 requires `spdx-python-model` bindings for `v3_1`. If generation fails
-with 3.1 selected, the extension warns and retries with SPDX 3.0.
+SPDX 3.1 requires `spdx-python-model` bindings for `v3_1`. The extension retries
+with SPDX 3.0 only when generation reports a specific missing-`v3_1` binding
+exception. Build/metadata errors, missing executables or the entire model
+package, permissions, timeouts, and unrecognized errors fail without a downgrade.
+Experimental 3.1 generation output is captured for this diagnosis and displayed
+when the command returns; default 3.0 generation continues streaming its output.
+
+Use `--timeout SECONDS` to adjust the generation deadline. See
+{ref}`operation-deadlines` for defaults
+and the separate interactive-server behavior.

@@ -13,7 +13,7 @@ import time
 import unittest
 import uuid
 
-from test_vulnscout import COMMAND_PATH, containers
+from test_vulnscout import COMMAND_PATH, containers, process
 
 
 WORKER = """
@@ -91,14 +91,27 @@ class VulnScoutIntegrationTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), '')
 
     def test_cache_lock_private_inputs_and_imports_with_attached_ui(self):
+        instance = containers.Container(
+            self.engine, self.name, info=lambda message: None,
+            warn=lambda message: None, debug=lambda message: None,
+        )
+        interface = instance.check_processing_support()
+        with self.assertRaisesRegex(process.VulnScoutError, 'processing timed out') as deadline:
+            instance.run_backend([
+                *interface.python, '-c',
+                "import time; time.sleep(60)",
+            ], lock=True, timeout=0.2, capture_output=True)
+        self.assertTrue(deadline.exception.timed_out)
+        self.assertIn('deadline exceeded', deadline.exception.stderr)
+        pending_path = f'{interface.workdir}/inputs/spdx/pending.spdx.json'
         self.container([
-            'exec', self.name, 'python', '-c',
-            "from pathlib import Path; p = Path('/scan/inputs/spdx/pending.spdx.json'); "
+            'exec', self.name, *interface.python, '-c',
+            f"from pathlib import Path; p = Path({pending_path!r}); "
             "p.parent.mkdir(parents=True, exist_ok=True); p.write_text('untouched')",
         ])
         with (self.directory / 'lock.log').open('w') as log:
             lock = subprocess.Popen([
-                self.engine, 'exec', self.name, 'python', '-c',
+                self.engine, 'exec', self.name, *interface.python, '-c',
                 "import fcntl, pathlib, time\n"
                 f"lock = open({containers.PROCESSING_LOCK!r}, 'a')\n"
                 "fcntl.flock(lock, fcntl.LOCK_EX)\n"
@@ -138,7 +151,7 @@ class VulnScoutIntegrationTests(unittest.TestCase):
                 for _ in range(120):
                     self.assertIsNone(server.poll(), (self.directory / 'serve.log').read_text())
                     response = subprocess.run([
-                        self.engine, 'exec', self.name, 'python', '-c',
+                        self.engine, 'exec', self.name, *interface.python, '-c',
                         "from urllib.request import urlopen; "
                         "assert urlopen('http://127.0.0.1:7275/', timeout=1).status == 200",
                     ], capture_output=True, timeout=10)
@@ -153,12 +166,12 @@ class VulnScoutIntegrationTests(unittest.TestCase):
                 self.assertIsNone(server.poll())
                 self.assert_no_workspaces()
                 projects = json.loads(self.container([
-                    'exec', '-w', '/scan', self.name,
-                    'flask', '--app', 'src.bin.webapp', 'list-projects', '--json',
+                    'exec', '-w', interface.workdir, self.name,
+                    *interface.cli, 'list-projects', '--json',
                 ]).stdout)
                 project = next(project for project in projects if project['name'] == 'isolation-check')
                 self.assertEqual({variant['name'] for variant in project['variants']}, {'first', 'second'})
-                pending = self.container(['exec', self.name, 'cat', '/scan/inputs/spdx/pending.spdx.json'])
+                pending = self.container(['exec', self.name, 'cat', pending_path])
                 self.assertEqual(pending.stdout, 'untouched')
             finally:
                 self.remove_container()

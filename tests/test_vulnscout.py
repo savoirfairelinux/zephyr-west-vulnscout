@@ -30,7 +30,15 @@ vulnscout = importlib.util.module_from_spec(SPEC)
 with patch.object(sys, 'path', [str(COMMAND_PATH.parent), *sys.path]):
     SPEC.loader.exec_module(vulnscout)
 
-from vulnscout_helpers import container as containers, options as config, process
+from vulnscout_helpers import backend, container as containers, options as config, process
+
+
+INTERFACE_DATA = {
+    'version': 1, 'features': ['isolated-inputs', 'python-fcntl'],
+    'entrypoint': ['/scan/src/entrypoint.sh'],
+    'cli': ['flask', '--app', 'src.bin.webapp'], 'python': ['python'], 'workdir': '/scan',
+}
+INTERFACE = backend.parse_interface(json.dumps(INTERFACE_DATA))
 
 
 def fail(message):
@@ -59,6 +67,11 @@ class VulnScoutCommandTests(unittest.TestCase):
         self.addCleanup(info.stop)
         self.parser = argparse.ArgumentParser()
         self.command.do_add_parser(self.parser.add_subparsers())
+        self.interface_patch = patch.object(
+            containers.Container, 'check_processing_support', return_value=INTERFACE,
+        )
+        self.interface_patch.start()
+        self.addCleanup(self.interface_patch.stop)
 
     def parse(self, *arguments):
         return self.parser.parse_args(['vulnscout', *arguments])
@@ -229,7 +242,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                     self.command.do_run(args, [])
                 run.assert_called_once_with(
                     ['podman', 'rm', '-f', 'demo'],
-                    check=True, capture_output=True, text=True, env=None,
+                    check=True, capture_output=True, text=True, env=None, timeout=30,
                 )
 
     def test_stop_honors_wrapper(self):
@@ -260,7 +273,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                             patch.object(containers, 'resolve_engine',
                                          return_value='podman'),
                             patch.object(containers.Container, 'ensure_running'),
-                            patch.object(containers.Container, 'check_processing_support'),
+                            patch.object(containers.Container, 'check_processing_support', return_value=INTERFACE),
                             patch.object(containers.Container, 'input_workspace',
                                          return_value=contextlib.nullcontext('/tmp/west-inputs')),
                             patch.object(containers.Container, 'stage_files',
@@ -274,8 +287,8 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                         else:
                             expected = [
                                 'podman', 'exec', '-e', 'VULNSCOUT_INPUTS_DIR=/tmp/west-inputs/inputs',
-                                'vulnscout', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
-                                '/cache/vulnscout/.west-vulnscout.lock', '/scan/src/entrypoint.sh',
+                                '-w', '/scan', 'vulnscout', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
+                                '/cache/vulnscout/.west-vulnscout.lock', '3600', '/scan/src/entrypoint.sh',
                             ]
                             spdx_file = '/tmp/app.spdx.json'
                         expected.extend([
@@ -339,7 +352,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                         '-e', 'FLASK_RUN_HOST=0.0.0.0', '-e', f'FLASK_RUN_PORT={port}',
                         '-v', f'{data_dir}:/cache/vulnscout',
                         config.DEFAULT_VULNSCOUT_IMAGE, 'daemon',
-                    ], check=True, capture_output=False, text=True, env=None)
+                    ], check=True, capture_output=False, text=True, env=None, timeout=300)
                     ready.assert_called_once_with()
 
     def test_serve_forwards_native_web_settings(self):
@@ -350,7 +363,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                 patch.object(config, 'VULNSCOUT_ENV_FLASK_RUN_PORT', '8080'),
                 patch.object(containers, 'resolve_engine', return_value='podman'),
                 patch.object(containers.Container, 'ensure_running'),
-                patch.object(containers.Container, 'check_processing_support'),
+                patch.object(containers.Container, 'check_processing_support', return_value=INTERFACE),
                 patch.object(containers.Container, 'input_workspace',
                              return_value=contextlib.nullcontext('/tmp/west-inputs')),
                 patch.object(subprocess, 'run') as run,
@@ -360,12 +373,13 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                 self.assertEqual(run.call_args.args[0], [
                     'podman', 'exec', '-e', 'VULNSCOUT_INPUTS_DIR=/tmp/west-inputs/inputs',
                     '-e', f'FLASK_RUN_HOST={host}', '-e', 'FLASK_RUN_PORT=8080',
-                    'vulnscout', '/scan/src/entrypoint.sh',
+                    '-w', '/scan', 'vulnscout', '/scan/src/entrypoint.sh',
                     '--project', 'default', '--variant', 'default',
                     '--serve',
                 ])
                 self.assertEqual(run.call_count, 2)
                 self.assertIn('--refresh-vulnerability-data', run.call_args_list[0].args[0])
+                self.assertIsNone(run.call_args.kwargs['timeout'])
 
     def test_invalid_native_web_settings_are_rejected(self):
         cases = [
@@ -420,7 +434,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                         patch.object(containers, 'resolve_engine',
                                      return_value='podman'),
                         patch.object(containers.Container, 'ensure_running'),
-                        patch.object(containers.Container, 'check_processing_support'),
+                        patch.object(containers.Container, 'check_processing_support', return_value=INTERFACE),
                         patch.object(containers.Container, 'input_workspace',
                                      return_value=contextlib.nullcontext('/tmp/west-inputs')),
                         patch.object(containers.Container, 'stage_files') as stage,
@@ -434,8 +448,8 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                     if not wrapper:
                         expected.extend([
                             '-e', 'VULNSCOUT_INPUTS_DIR=/tmp/west-inputs/inputs',
-                            'vulnscout', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
-                            '/cache/vulnscout/.west-vulnscout.lock', '/scan/src/entrypoint.sh',
+                            '-w', '/scan', 'vulnscout', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
+                            '/cache/vulnscout/.west-vulnscout.lock', '3600', '/scan/src/entrypoint.sh',
                         ])
                     expected.extend([
                         '--project', 'demo', '--variant', 'native',
@@ -475,7 +489,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                     self.subTest(wrapper=wrapper, status=status),
                     patch.object(containers, 'resolve_engine', return_value='podman'),
                     patch.object(containers.Container, 'ensure_running'),
-                    patch.object(containers.Container, 'check_processing_support'),
+                    patch.object(containers.Container, 'check_processing_support', return_value=INTERFACE),
                     patch.object(containers.Container, 'input_workspace',
                                  return_value=contextlib.nullcontext('/tmp/west-inputs')),
                     patch.object(self.command, 'die', side_effect=fail),
@@ -501,7 +515,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
         with (
             patch.object(containers, 'resolve_engine', return_value='podman'),
             patch.object(containers.Container, 'ensure_running'),
-            patch.object(containers.Container, 'check_processing_support'),
+            patch.object(containers.Container, 'check_processing_support', return_value=INTERFACE),
             patch.object(containers.Container, 'input_workspace',
                          return_value=contextlib.nullcontext('/tmp/west-inputs')),
             patch.object(self.command, 'die', side_effect=fail),
@@ -610,7 +624,8 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                     scan.assert_not_called()
                     expected = [
                         engine, 'exec', '-e', 'GENERATE_DOCUMENTS=', '-w', '/scan',
-                        'demo', 'flask', '--app', 'src.bin.webapp',
+                        'demo', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM, '', '3600',
+                        'flask', '--app', 'src.bin.webapp',
                         'report', 'all_assessments.adoc', '--project', 'zephyr',
                         '--variant', 'native', '--output-dir', report_dir,
                     ]
@@ -791,12 +806,14 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                     self.assertEqual(run.call_count, 4)
                     self.assertEqual(run.call_args_list[0].args[0], [
                         engine, 'exec', '-w', '/scan', 'demo',
+                        'python', '-c', containers.PROCESSING_LOCK_PROGRAM, '', '30',
                         'flask', '--app', 'src.bin.webapp', 'list-projects', '--json',
                     ])
                     self.assertTrue(run.call_args_list[0].kwargs['capture_output'])
                     self.assertEqual(run.call_args_list[1].args[0], [
                         engine, 'exec', '-e', 'GENERATE_DOCUMENTS=', '-w', '/scan',
-                        'demo', 'flask', '--app', 'src.bin.webapp',
+                        'demo', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM, '', '3600',
+                        'flask', '--app', 'src.bin.webapp',
                         'export', '--format', output_format, '--variant-id', selected_id,
                         '--output-dir', temporary_dir,
                     ])
@@ -955,7 +972,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                 self.subTest(status=status),
                 patch.object(containers, 'resolve_engine', return_value='podman'),
                 patch.object(containers.Container, 'ensure_running'),
-                patch.object(containers.Container, 'check_processing_support'),
+                patch.object(containers.Container, 'check_processing_support', return_value=INTERFACE),
                 patch.object(subprocess, 'run', side_effect=[success, success, result, success]) as run,
             ):
                 args = self.parse('--match-condition', 'cvss >= 9')
@@ -971,9 +988,9 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                 ])
                 command = run.call_args_list[2].args[0]
                 self.assertIn(f'VULNSCOUT_INPUTS_DIR={directory}/inputs', command)
-                self.assertEqual(command[5:10], [
+                self.assertEqual(command[7:13], [
                     'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
-                    containers.PROCESSING_LOCK, '/scan/src/entrypoint.sh',
+                    containers.PROCESSING_LOCK, '3600', '/scan/src/entrypoint.sh',
                 ])
                 self.assertEqual(run.call_args.args[0][-4:], ['rm', '-rf', '--', directory])
 
@@ -982,7 +999,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
         with (
             patch.object(containers, 'resolve_engine', return_value='podman'),
             patch.object(containers.Container, 'ensure_running'),
-            patch.object(containers.Container, 'check_processing_support'),
+            patch.object(containers.Container, 'check_processing_support', return_value=INTERFACE),
             patch.object(subprocess, 'run', side_effect=[
                 success, success, subprocess.CalledProcessError(1, 'cp'), success,
             ]) as run,
@@ -1013,7 +1030,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
             marker = pathlib.Path(directory) / 'ready'
             command = [
                 sys.executable, '-c', containers.PROCESSING_LOCK_PROGRAM,
-                str(pathlib.Path(directory) / 'lock'), sys.executable, '-c',
+                str(pathlib.Path(directory) / 'lock'), '5', sys.executable, '-c',
             ]
             with subprocess.Popen([
                 *command, 'import pathlib, sys; pathlib.Path(sys.argv[1]).touch(); sys.stdin.read(1)',
@@ -1037,6 +1054,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                 ).returncode, status)
 
     def test_incompatible_image_is_rejected_before_staging(self):
+        self.interface_patch.stop()
         with (
             patch.object(containers, 'resolve_engine', return_value='podman'),
             patch.object(containers.Container, 'ensure_running'),
@@ -1044,7 +1062,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
             patch.object(containers.Container, 'stage_files') as stage,
             patch.object(subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'probe')),
         ):
-            with self.assertRaisesRegex(process.VulnScoutError, 'requires Python fcntl and VULNSCOUT_INPUTS_DIR'):
+            with self.assertRaisesRegex(process.VulnScoutError, 'Reading VulnScout interface contract failed'):
                 self.command._run_vulnscout(self.parse(), ['/host/app.jsonld'], '/cache')
             workspace.assert_not_called()
             stage.assert_not_called()
@@ -1075,6 +1093,90 @@ assert issubclass(process.VulnScoutError, RuntimeError)
             with self.assertRaises(process.VulnScoutError):
                 process.run_command(['policy'], 'Policy')
 
+    def test_generation_retries_only_for_confirmed_missing_31_bindings(self):
+        missing = "AttributeError: module 'spdx_python_model' has no attribute 'v3_1'\n"
+        args = self.parse('--spdx-version', '3.1', '--include-sdk', '--analyze-includes', '--timeout', '20')
+        with (
+            patch.object(self.command, 'wrn') as warning,
+            patch.object(subprocess, 'run', side_effect=[
+                subprocess.CalledProcessError(1, 'west', stderr=missing),
+                subprocess.CompletedProcess([], 0, '', ''),
+            ]) as run,
+        ):
+            self.command._run_west_spdx(args, '/build', '/spdx')
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[0].args[0][-4:], ['--spdx-version', '3.1', '--include-sdk', '--analyze-includes'])
+            self.assertEqual(run.call_args_list[1].args[0][-4:], ['--spdx-version', '3.0', '--include-sdk', '--analyze-includes'])
+            self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list], [20, 20])
+            warning.assert_called_once()
+
+    def test_generation_does_not_downgrade_unrelated_failures_or_timeouts(self):
+        for failure in [
+            subprocess.CalledProcessError(1, 'west', stderr='PermissionError: denied'),
+            subprocess.CalledProcessError(1, 'west', stderr='Invalid CMake metadata'),
+            subprocess.CalledProcessError(1, 'west', stderr="ModuleNotFoundError: No module named 'spdx_python_model'"),
+            subprocess.CalledProcessError(1, 'west', stderr='unsupported SPDX version 3.1'),
+            subprocess.CalledProcessError(1, 'west', stderr=(
+                "AttributeError: module 'spdx_python_model' has no attribute 'v3_1'\n"
+                "PermissionError: unrelated terminal failure"
+            )),
+            subprocess.TimeoutExpired('west', 1, stderr=b'old v3_1 error'),
+            FileNotFoundError('west unavailable'),
+        ]:
+            with (
+                self.subTest(failure=failure),
+                patch.object(self.command, 'wrn') as warning,
+                patch.object(subprocess, 'run', side_effect=failure) as run,
+            ):
+                with self.assertRaises(process.VulnScoutError):
+                    self.command._run_west_spdx(self.parse('--spdx-version', '3.1'), '/build', '/spdx')
+                run.assert_called_once()
+                warning.assert_not_called()
+
+    def test_generation_preserves_captured_31_output(self):
+        with (
+            patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'progress\n', 'experimental\n')),
+            contextlib.redirect_stdout(io.StringIO()) as stdout,
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.command._run_west_spdx(self.parse('--spdx-version', '3.1'), '/build', '/spdx')
+            self.assertEqual(stdout.getvalue(), 'progress\n')
+            self.assertEqual(stderr.getvalue(), 'experimental\n')
+
+    def test_invalid_timeouts_are_rejected_before_execution(self):
+        for value in ['0', '-1', 'nan', 'inf', 'not-a-number', '86401']:
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self.parse('--timeout', value)
+
+    def test_management_and_probe_timeouts_are_explicit(self):
+        with patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+            self.container().state()
+            self.assertEqual(run.call_args.kwargs['timeout'], 30)
+            self.container().wait_ready()
+            self.assertEqual(run.call_args.kwargs['timeout'], 5)
+        with patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired('exec', 5)) as run:
+            with self.assertRaisesRegex(process.VulnScoutError, 'timed out after 5 seconds'):
+                self.container().wait_ready()
+            run.assert_called_once()
+
+    def test_wrapper_deadline_and_interactive_exemption(self):
+        for serve, expected in [(False, 12), (True, None)]:
+            args = self.parse('--vulnscout-cmd', 'wrapper', '--timeout', '12', *(['--serve'] if serve else []))
+            with self.subTest(serve=serve), patch.object(subprocess, 'run') as run:
+                self.command._run_vulnscout(args, [], '/cache')
+                self.assertEqual(run.call_args.kwargs['timeout'], expected)
+
+    def test_timeout_diagnostics_decode_partial_output(self):
+        with patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired(
+            ['query'], 2, output=b'partial output', stderr=b'engine stalled',
+        )):
+            with self.assertRaisesRegex(process.VulnScoutError, 'Query timed out after 2 seconds: engine stalled') as error:
+                process.run_command(['query'], 'Query', capture_output=True, timeout=2)
+            self.assertTrue(error.exception.timed_out)
+            self.assertEqual(error.exception.stdout, 'partial output')
+            self.assertEqual(error.exception.stderr, 'engine stalled')
+
     def test_readiness_uses_common_diagnostics(self):
         with (
             patch.object(time, 'sleep'),
@@ -1096,6 +1198,181 @@ assert issubclass(process.VulnScoutError, RuntimeError)
         self.assertEqual(containers.container_exec(
             'podman', 'demo', ['command', 'one argument'], environment={'KEY': 'a b'}, workdir='/my dir',
         ), ['podman', 'exec', '-e', 'KEY=a b', '-w', '/my dir', 'demo', 'command', 'one argument'])
+
+
+class BackendInterfaceTests(unittest.TestCase):
+    def container(self, **kwargs):
+        return containers.Container(
+            'podman', 'isolated', info=lambda message: None, warn=lambda message: None,
+            debug=lambda message: None, **kwargs,
+        )
+
+    def test_contract_rejects_missing_unsupported_and_malformed_fields(self):
+        invalid = ['', '<no value>', '{}', '[]', 'null']
+        for updates in [
+            {'version': 2}, {'version': True}, {'features': []}, {'features': ['isolated-inputs']},
+            {'features': 'isolated-inputs'}, {'entrypoint': []}, {'cli': 'flask'},
+            {'python': ['']}, {'python': [None]}, {'workdir': 'relative'},
+            {'workdir': '/opt/../scan'}, {'workdir': None},
+        ]:
+            invalid.append(json.dumps({**INTERFACE_DATA, **updates}))
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaisesRegex(process.VulnScoutError, 'Rebuild or upgrade'):
+                backend.parse_interface(payload)
+
+    def test_contract_is_read_once_from_metadata_without_source_probing(self):
+        instance = self.container()
+        with patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess(
+            [], 0, json.dumps({backend.INTERFACE_LABEL: json.dumps(INTERFACE_DATA)}), '',
+        )) as run:
+            self.assertEqual(instance.check_processing_support(), INTERFACE)
+            self.assertIs(instance.check_processing_support(), instance.check_processing_support())
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0], [
+                'podman', 'inspect', '--format',
+                '{{json .Config.Labels}}', 'isolated',
+            ])
+            self.assertEqual(run.call_args.kwargs['timeout'], 30)
+
+    def test_unlabeled_v023_uses_explicit_version_adapter(self):
+        self.assertEqual(
+            backend.resolve_interface(json.dumps({backend.VERSION_LABEL: 'v0.23'})),
+            backend.BackendInterface(
+                entrypoint=('/scan/src/entrypoint.sh',),
+                cli=('flask', '--app', 'src.bin.webapp'),
+                python=('python3',), workdir='/scan',
+            ),
+        )
+
+    def test_unknown_or_invalid_metadata_is_not_guessed_from_tags(self):
+        payloads = ['', 'null', '[]', '{}', 'not JSON']
+        payloads.extend(json.dumps({backend.VERSION_LABEL: version}) for version in (
+            'v0.22', 'v0.24', 'latest', '0.23', '', None, ['v0.23'],
+        ))
+        for payload in payloads:
+            with self.subTest(payload=payload), self.assertRaisesRegex(
+                process.VulnScoutError, 'Image tags alone',
+            ):
+                backend.resolve_interface(payload)
+
+    def test_invalid_declaration_never_falls_back_to_v023_adapter(self):
+        for declaration in ('', '{}', 'null', 'invalid JSON', None, False, INTERFACE_DATA,
+                            json.dumps({**INTERFACE_DATA, 'version': 2}),
+                            json.dumps({**INTERFACE_DATA, 'features': []})):
+            with self.subTest(declaration=declaration), self.assertRaises(process.VulnScoutError):
+                backend.resolve_interface(json.dumps({
+                    backend.VERSION_LABEL: 'v0.23', backend.INTERFACE_LABEL: declaration,
+                }))
+
+    def test_valid_declaration_takes_precedence_over_version_adapter(self):
+        declaration = {**INTERFACE_DATA, 'workdir': '/opt/service'}
+        for version in ('v0.23', 'v0.24', None):
+            with self.subTest(version=version):
+                self.assertEqual(backend.resolve_interface(json.dumps({
+                    backend.VERSION_LABEL: version,
+                    backend.INTERFACE_LABEL: json.dumps(declaration),
+                })), backend.parse_interface(json.dumps(declaration)))
+
+    def test_v023_adapter_is_selected_before_starting_stopped_container(self):
+        instance = self.container()
+        success = subprocess.CompletedProcess([], 0, '', '')
+        metadata = subprocess.CompletedProcess(
+            [], 0, json.dumps({backend.VERSION_LABEL: 'v0.23'}), '',
+        )
+        with (
+            patch.object(instance, 'state', return_value='exited'),
+            patch.object(instance, 'data_mount', return_value='/host/cache'),
+            patch.object(instance, 'wait_ready') as ready,
+            patch.object(instance, 'info') as info,
+            patch.object(subprocess, 'run', side_effect=[metadata, success]) as run,
+        ):
+            instance.ensure_running('/host/cache', 'ignored:image', '0.0.0.0', '7275')
+            self.assertEqual(run.call_args_list[0].args[0], [
+                'podman', 'inspect', '--format', '{{json .Config.Labels}}', 'isolated',
+            ])
+            self.assertEqual(run.call_args_list[1].args[0], ['podman', 'start', 'isolated'])
+            self.assertIs(instance.check_processing_support(), backend.V023_INTERFACE)
+            self.assertEqual(run.call_count, 2)
+            info.assert_any_call('Using the built-in VulnScout v0.23 compatibility adapter')
+            ready.assert_called_once()
+
+    def test_discovered_commands_and_workdir_are_used_without_scan_paths(self):
+        interface = backend.parse_interface(json.dumps({
+            **INTERFACE_DATA, 'entrypoint': ['/opt/service/start'],
+            'cli': ['/opt/service/bin/cli', '--app', 'app'],
+            'python': ['/opt/service/bin/python3'], 'workdir': '/opt/service',
+        }))
+        instance = self.container(timeout=7)
+        with (
+            patch.object(instance, 'check_processing_support', return_value=interface),
+            patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run,
+        ):
+            instance.run_processing(['--project', 'one'], '/tmp/owned')
+            command = run.call_args.args[0]
+            self.assertEqual(command[:9], [
+                'podman', 'exec', '-e', 'VULNSCOUT_INPUTS_DIR=/tmp/owned/inputs',
+                '-w', '/opt/service', 'isolated', '/opt/service/bin/python3', '-c',
+            ])
+            self.assertEqual(command[-4:], ['7', '/opt/service/start', '--project', 'one'])
+            self.assertEqual(run.call_args.kwargs['timeout'], 42)
+            instance.run_backend([*interface.cli, 'report', 'summary.adoc'])
+            self.assertEqual(run.call_args.args[0][-5:], [
+                '/opt/service/bin/cli', '--app', 'app', 'report', 'summary.adoc',
+            ])
+
+    def test_backend_timeout_does_not_masquerade_as_policy_or_lock_contention(self):
+        instance = self.container(timeout=1)
+        with (
+            patch.object(instance, 'check_processing_support', return_value=INTERFACE),
+            patch.object(subprocess, 'run', side_effect=subprocess.CalledProcessError(124, 'backend')),
+        ):
+            with self.assertRaisesRegex(process.VulnScoutError, 'timed out after 1 seconds') as error:
+                instance.run_processing([], '/tmp/owned', accepted_codes=(0, 2))
+            self.assertTrue(error.exception.timed_out)
+
+    @unittest.skipUnless(os.name == 'posix', 'container deadline uses POSIX process groups')
+    def test_inner_deadline_stops_descendants_before_releasing_the_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = pathlib.Path(directory) / 'descendant'
+            pidfile = pathlib.Path(directory) / 'pid'
+            grandchild = (
+                "import os, pathlib, signal, sys, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "pathlib.Path(sys.argv[2]).write_text(str(os.getpid()) + ' ' + str(os.getpgrp())); "
+                "p = pathlib.Path(sys.argv[1]); p.write_text('ready'); "
+                "time.sleep(1); p.write_text('escaped'); time.sleep(10)"
+            )
+            child = (
+                "import subprocess, sys, time; "
+                f"subprocess.Popen([sys.executable, '-c', {grandchild!r}, sys.argv[1], sys.argv[2]]); "
+                "time.sleep(10)"
+            )
+            prefix = [
+                sys.executable, '-c', containers.PROCESSING_LOCK_PROGRAM,
+                str(pathlib.Path(directory) / 'lock'),
+            ]
+            try:
+                result = subprocess.run(
+                    [*prefix, '0.5', sys.executable, '-c', child, str(marker), str(pidfile)],
+                    capture_output=True, text=True, timeout=8,
+                )
+                self.assertEqual(result.returncode, 124, result.stderr)
+                self.assertEqual(marker.read_text(), 'ready')
+                time.sleep(1.1)
+                self.assertEqual(marker.read_text(), 'ready')
+                released = subprocess.run(
+                    [*prefix, '1', sys.executable, '-c', 'raise SystemExit(0)'],
+                    capture_output=True, text=True, timeout=3,
+                )
+                self.assertEqual(released.returncode, 0, released.stderr)
+            finally:
+                if pidfile.exists():
+                    try:
+                        pid, group = map(int, pidfile.read_text().split())
+                        if os.getpgid(pid) == group:
+                            os.kill(pid, 9)
+                    except ProcessLookupError:
+                        pass
 
 
 if __name__ == '__main__':

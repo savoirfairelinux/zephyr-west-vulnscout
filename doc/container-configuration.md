@@ -51,15 +51,66 @@ This also coordinates participating containers mounting the same host cache.
 The lock file may remain after processing; its presence does not mean the lock
 is held. Do not delete it to clear a busy error.
 
-The image must provide Python with the standard `fcntl` module and an entrypoint
-supporting `VULNSCOUT_INPUTS_DIR`. Compatibility is checked before staging files;
-unsupported images fail explicitly rather than falling back to shared inputs.
+Published v0.23 images work without rebuilding VulnScout or changing its backend.
+When no `io.vulnscout.interface` label exists, West selects its built-in v0.23
+adapter only if `org.opencontainers.image.version` is exactly `v0.23`.
+The adapter centralizes that release's standard entrypoint, CLI prefix, Python
+interpreter, and `/scan` working directory. This is an explicit version dependency,
+not source-code probing or a guess based on an image tag.
+
+Images can optionally declare version 1 of the `io.vulnscout.interface` OCI label,
+including `isolated-inputs` and `python-fcntl` capabilities. A valid declaration
+takes precedence over the adapter and supplies the commands and working directory
+for relocated or newer images. Both modes use `/cache/vulnscout` as the public
+persistent-cache mount. Processing requires isolated-input support and Python's
+POSIX locking and process-group facilities; execution errors are reported normally.
+
+Inspect the declaration with:
+
+```sh
+podman inspect vulnscout --format '{{json .Config.Labels}}'
+```
+
+West validates this metadata before staging files or starting a stopped
+container. Unknown versions without a declaration are rejected. A present but
+malformed or unsupported declaration is also rejected, even if the version label
+is `v0.23`; it never silently falls back to the adapter. Custom images that change
+the v0.23 layout must declare their actual interface rather than relying on the
+standard adapter. Existing standard v0.23 containers need no recreation.
 
 Direct-mode `--serve` starts the UI after processing and releasing the lock,
 so later West imports can run while the interface remains open. These guarantees
 apply to direct West processing, not wrapper commands, API requests, or other
 native VulnScout clients. Coordinate those writers separately, and do not
 override `INPUTS_DIR` in a mounted configuration file.
+
+(operation-deadlines)=
+## Operation deadlines
+
+`--timeout SECONDS` bounds each finite generation, import, scan, refresh, report,
+export, or file-copy operation. The default is 3600 seconds; positive fractional
+values are allowed, up to 86400 seconds. Increase it for long scans:
+
+```sh
+west vulnscout -d build --perform-scan --timeout 7200
+```
+
+Container metadata, lifecycle cleanup, and interface queries have a 30-second
+client deadline. Readiness probes have a 5-second deadline per attempt, and
+container creation/start allows 300 seconds, including image retrieval.
+
+Direct backend operations also enforce the deadline inside the container.
+On expiry, the supervisor terminates the operation's process group, allows up to
+5 seconds for graceful exit, then kills remaining children before releasing the
+processing lock and cleaning owned inputs. The client allows an additional
+35 seconds for that shutdown and container-engine overhead. A timeout is an
+execution error, not a vulnerability-policy match, and never causes an SPDX
+version downgrade.
+
+The attached web server deliberately has no lifetime timeout. In direct mode,
+its preceding processing phase is still bounded. Wrapper `--serve` remains an
+interactive session owned by the wrapper; other wrapper invocations have a
+client deadline, but West cannot supervise wrapper-managed container jobs.
 
 ## Image selection
 

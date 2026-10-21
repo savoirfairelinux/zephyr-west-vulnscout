@@ -9,6 +9,7 @@ from collections.abc import Sequence
 import glob
 import os
 import pathlib
+import sys
 import textwrap
 import uuid
 
@@ -16,7 +17,7 @@ from west.commands import WestCommand
 from west.util import quote_sh_list
 
 from vulnscout_helpers import container, options
-from vulnscout_helpers.process import VulnScoutError, run_command
+from vulnscout_helpers.process import DEFAULT_OPERATION_TIMEOUT, MANAGEMENT_TIMEOUT, VulnScoutError, run_command
 
 
 VULNSCOUT_DESCRIPTION = """\
@@ -192,6 +193,11 @@ class ZephyrVulnScout(WestCommand):
                 '(default: <build-dir>/../.vulnscout/cache)'
             ),
         )
+        container.add_argument(
+            '--timeout', type=options.positive_timeout, default=DEFAULT_OPERATION_TIMEOUT,
+            metavar='SECONDS',
+            help='deadline per finite SBOM/backend operation (default: 3600; maximum: 86400)',
+        )
         scanning.add_argument(
             '--perform-scan',
             action='store_true',
@@ -307,15 +313,16 @@ class ZephyrVulnScout(WestCommand):
     def _container(self, args: argparse.Namespace) -> container.Container:
         return container.Container(
             container.resolve_engine(args.container_engine), args.container_name,
-            info=self.inf, warn=self.wrn, debug=self.dbg,
+            info=self.inf, warn=self.wrn, debug=self.dbg, timeout=args.timeout,
         )
 
     def _resolve_export_variant_id(self, instance: container.Container, args: argparse.Namespace) -> str:
-        command = container.container_exec(
-            instance.engine, instance.name,
-            ['flask', '--app', 'src.bin.webapp', 'list-projects', '--json'], workdir='/scan',
+        interface = instance.check_processing_support()
+        result = instance.run_backend(
+            [*interface.cli, 'list-projects', '--json'],
+            'Could not resolve export scope: list-projects',
+            capture_output=True, timeout=MANAGEMENT_TIMEOUT,
         )
-        result = run_command(command, 'Could not resolve export scope: list-projects', capture_output=True)
         return options.export_variant_id(result.stdout, args.project, args.variant)
 
     def _run_stored_output(
@@ -335,20 +342,20 @@ class ZephyrVulnScout(WestCommand):
             args.output_dir or os.path.join(build_dir, f'vulnscout-{action}s')
         )
         output_path = os.path.join(output_dir, filename)
-        command = container.container_exec(
-            instance.engine, instance.name,
-            ['flask', '--app', 'src.bin.webapp', *parameters, *scope, '--output-dir', temporary_dir],
-            environment={'GENERATE_DOCUMENTS': ''}, workdir='/scan',
-        )
+        interface = instance.check_processing_support()
+        command = [*interface.cli, *parameters, *scope, '--output-dir', temporary_dir]
         if action == 'report' and args.format:
             command.extend(['--format', args.format])
         self.inf(f'Generating VulnScout {action}: {quote_sh_list(command)}')
         try:
-            run_command(command, f'{action.capitalize()} generation or retrieval')
+            instance.run_backend(
+                command, f'{action.capitalize()} generation or retrieval',
+                environment={'GENERATE_DOCUMENTS': ''},
+            )
             os.makedirs(output_dir, exist_ok=True)
             run_command([
                 instance.engine, 'cp', f'{instance.name}:{temporary_dir}/{filename}', output_path,
-            ], f'{action.capitalize()} generation or retrieval')
+            ], f'{action.capitalize()} generation or retrieval', timeout=args.timeout)
         except OSError as e:
             raise VulnScoutError(f'Could not write {action} output: {e}') from e
         finally:
@@ -376,13 +383,22 @@ class ZephyrVulnScout(WestCommand):
         requested_version = args.spdx_version
         cmd = options.spdx_command(args, build_dir, spdx_dir, requested_version)
         self.inf(f'Generating SPDX {requested_version} SBOM with: {quote_sh_list(cmd)}')
+        capture_output = requested_version == '3.1'
         try:
-            run_command(cmd, 'west spdx')
+            result = run_command(cmd, 'west spdx', capture_output=capture_output, timeout=args.timeout)
+            if capture_output:
+                sys.stdout.write(result.stdout or '')
+                sys.stderr.write(result.stderr or '')
             return
         except VulnScoutError as error:
-            if requested_version == '3.1' and error.returncode is not None:
+            if capture_output and error.stdout:
+                sys.stdout.write(error.stdout)
+            if (
+                requested_version == '3.1' and error.returncode == 1 and not error.timed_out
+                and options.spdx31_bindings_unavailable(error.stderr)
+            ):
                 self.wrn(
-                    'west spdx failed for SPDX 3.1; retrying with SPDX 3.0. '
+                    'SPDX 3.1 Python bindings are unavailable; retrying with SPDX 3.0. '
                     'Install a spdx-python-model build with v3_1 bindings to use SPDX 3.1.'
                 )
             else:
@@ -390,7 +406,7 @@ class ZephyrVulnScout(WestCommand):
         fallback_cmd = options.spdx_command(args, build_dir, spdx_dir, '3.0')
 
         self.inf(f'Retrying SPDX generation with: {quote_sh_list(fallback_cmd)}')
-        run_command(fallback_cmd, 'west spdx')
+        run_command(fallback_cmd, 'west spdx', timeout=args.timeout)
 
     def _resolve_spdx_files(self, explicit_files: Sequence[str], spdx_dir: str) -> list[str]:
         resolved = []
@@ -429,12 +445,15 @@ class ZephyrVulnScout(WestCommand):
             env = os.environ.copy()
             env.update(options.image_environment(args))
             self.inf(f'Running VulnScout command: {quote_sh_list(command)}')
-            result = run_command(command, 'VulnScout', env=env, accepted_codes=accepted_codes)
+            result = run_command(
+                command, 'VulnScout', env=env, accepted_codes=accepted_codes,
+                timeout=None if args.serve else args.timeout,
+            )
             return 2 if result.returncode == 2 else 0
 
         instance = self._container(args)
         instance.ensure_running(data_dir, options.resolve_image(args), *options.configured_web_settings())
-        instance.check_processing_support()
+        interface = instance.check_processing_support()
         if args.serve:
             self.inf(
                 'Processing before starting the web interface; an existing web server is left running'
@@ -449,12 +468,13 @@ class ZephyrVulnScout(WestCommand):
             host, port = options.configured_web_settings()
             serve_command = container.container_exec(
                 instance.engine, instance.name,
-                ['/scan/src/entrypoint.sh', '--project', args.project, '--variant', args.variant, '--serve'],
+                [*interface.entrypoint, '--project', args.project, '--variant', args.variant, '--serve'],
                 environment={
                     'VULNSCOUT_INPUTS_DIR': f'{directory}/inputs',
                     'FLASK_RUN_HOST': host, 'FLASK_RUN_PORT': port,
                 },
+                workdir=interface.workdir,
             )
             self.inf(f'Starting web interface: {quote_sh_list(serve_command)}')
-            run_command(serve_command, 'VulnScout web interface')
+            run_command(serve_command, 'VulnScout web interface', timeout=None)
         return 2 if exit_code == 2 else 0

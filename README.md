@@ -25,6 +25,7 @@ into VulnScout for vulnerability analysis.
 - `scripts/west_commands/vulnscout_helpers/options.py`: configuration, validation, and command builders
 - `scripts/west_commands/vulnscout_helpers/container.py`: container lifecycle, cache protection, staging, and locking
 - `scripts/west_commands/vulnscout_helpers/process.py`: subprocess execution and shared errors
+- `scripts/west_commands/vulnscout_helpers/backend.py`: image-interface validation and v0.23 compatibility
 
 The helper package is independent of West. West's extension loader makes it
 importable alongside the command, without requiring the repository as the
@@ -108,9 +109,11 @@ example with `-d demo/mbedtls_sbom/build`, the database is stored at
 
 Every direct data operation refuses a mismatched or missing cache mount.
 Imports use private inputs and fail immediately if another West invocation is
-processing the same cache. The image must support `VULNSCOUT_INPUTS_DIR` and
-provide Python's standard `fcntl` module; wrapper and other native clients need
-separate coordination.
+processing the same cache. Published v0.23 images work without backend changes
+through a built-in, version-specific adapter. Images can optionally declare the
+`io.vulnscout.interface` label to describe their commands and capabilities.
+Unknown versions without a declaration and invalid declarations are rejected.
+Wrapper and other native clients need separate coordination.
 See [Container Lifecycle and Configuration](doc/container-configuration.md).
 
 If SPDX files already exist and you only want to import them:
@@ -294,13 +297,15 @@ container and temporary cache, with networking disabled; it does not use the
 existing `vulnscout` container.
 
 ```sh
-VULNSCOUT_INTEGRATION_IMAGE=localhost/sfl:custom \
+VULNSCOUT_INTEGRATION_IMAGE=docker.io/sflinux/vulnscout:v0.23 \
 VULNSCOUT_INTEGRATION_SPDX_DIR=../demo/mbedtls_sbom/build/spdx \
 python -m unittest discover -s tests -p test_vulnscout_integration.py -v
 ```
 
 Set `VULNSCOUT_INTEGRATION_ENGINE=docker` to use Docker instead of Podman.
-The smoke test covers cache refusal, lock contention, private-input cleanup,
+Use a locally available v0.23 image or one declaring a valid interface contract;
+no backend rebuild or additional label is required for the published v0.23 image.
+The smoke test covers native deadlines, cache refusal, lock contention, private-input cleanup,
 variant selection, untouched shared inputs, and importing while an attached
 web interface remains running.
 
