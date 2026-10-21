@@ -478,6 +478,143 @@ class VulnScoutCommandTests(unittest.TestCase):
                 warning.assert_called_once()
                 self.assertIn('permission denied', warning.call_args.args[0])
 
+    def test_export_formats_skip_import_and_copy_only_the_scoped_output(self):
+        selected_id = '00000000-0000-0000-0000-000000000002'
+        projects = [
+            {'name': 'other', 'variants': [{'name': 'native', 'id': str(vulnscout.uuid.UUID(int=3))}]},
+            {'name': 'zephyr', 'variants': [{'name': 'native', 'id': selected_id}]},
+        ]
+        for engine in ['podman', 'docker']:
+            for output_format, filename in vulnscout.SBOM_EXPORT_FILES.items():
+                with (
+                    self.subTest(engine=engine, format=output_format),
+                    tempfile.TemporaryDirectory() as build_dir,
+                ):
+                    args = self.parse(
+                        'export', '-d', build_dir, '--container-engine', engine,
+                        '--container-name', 'demo', '--project', 'zephyr', '--variant', 'native',
+                        '--format', output_format, '--output-dir', build_dir,
+                    )
+                    cache = self.command._resolve_vulnscout_data_dir(args, build_dir)
+                    temporary_dir = '/tmp/vulnscout_export_00000000000000000000000000000001'
+                    with (
+                        patch.object(self.command, '_resolve_container_engine', return_value=engine),
+                        patch.object(self.command, '_ensure_container_running') as ensure,
+                        patch.object(self.command, '_get_container_data_mount', return_value=cache),
+                        patch.object(self.command, '_run_west_spdx') as generate,
+                        patch.object(self.command, '_resolve_spdx_files') as resolve,
+                        patch.object(self.command, '_run_vulnscout') as scan,
+                        patch.object(vulnscout.uuid, 'uuid4', return_value=vulnscout.uuid.UUID(int=1)),
+                        patch.object(vulnscout.subprocess, 'run') as run,
+                    ):
+                        run.return_value = subprocess.CompletedProcess(
+                            [], 0, vulnscout.json.dumps(projects), '',
+                        )
+                        self.command.do_run(args, [])
+                    ensure.assert_called_once_with(engine, 'demo', args, cache)
+                    generate.assert_not_called()
+                    resolve.assert_not_called()
+                    scan.assert_not_called()
+                    self.assertEqual(run.call_count, 4)
+                    self.assertEqual(run.call_args_list[0].args[0], [
+                        engine, 'exec', '-w', '/scan', 'demo',
+                        'flask', '--app', 'src.bin.webapp', 'list-projects', '--json',
+                    ])
+                    self.assertTrue(run.call_args_list[0].kwargs['capture_output'])
+                    self.assertEqual(run.call_args_list[1].args[0], [
+                        engine, 'exec', '-e', 'GENERATE_DOCUMENTS=', '-w', '/scan',
+                        'demo', 'flask', '--app', 'src.bin.webapp',
+                        'export', '--format', output_format, '--variant-id', selected_id,
+                        '--output-dir', temporary_dir,
+                    ])
+                    self.assertEqual(run.call_args_list[2].args[0], [
+                        engine, 'cp', f'demo:{temporary_dir}/{filename}',
+                        str(pathlib.Path(build_dir) / filename),
+                    ])
+                    self.assertEqual(run.call_args_list[3].args[0], [
+                        engine, 'exec', 'demo', 'rm', '-rf', '--', temporary_dir,
+                    ])
+                    self.assertTrue(all(call.kwargs['check'] for call in run.call_args_list[:3]))
+
+    def test_export_defaults_to_spdx3_and_stops_after_success(self):
+        with tempfile.TemporaryDirectory() as build_dir:
+            args = self.parse('export', '-d', build_dir, '--stop-after-run')
+            cache = self.command._resolve_vulnscout_data_dir(args, build_dir)
+            with (
+                patch.object(self.command, '_resolve_container_engine', return_value='podman'),
+                patch.object(self.command, '_ensure_container_running'),
+                patch.object(self.command, '_get_container_data_mount', return_value=cache),
+                patch.object(self.command, '_resolve_export_variant_id', return_value=str(vulnscout.uuid.UUID(int=1))),
+                patch.object(self.command, '_stop_vulnscout_container') as stop,
+                patch.object(vulnscout.subprocess, 'run') as run,
+            ):
+                run.return_value = subprocess.CompletedProcess([], 0, '', '')
+                self.command.do_run(args, [])
+            self.assertIn('spdx3', run.call_args_list[0].args[0])
+            self.assertEqual(run.call_args_list[1].args[0][-1], str(
+                pathlib.Path(build_dir) / 'vulnscout-exports/sbom_spdx_v3_0.spdx.json'
+            ))
+            stop.assert_called_once_with(args)
+
+    def test_export_rejects_conflicting_options_and_report_formats(self):
+        cases = [
+            ['--stop'], ['--serve'], ['--perform-scan'], ['--refresh-vulnerability-data'],
+            ['--no-generate'], ['--spdx-file', 'app.jsonld'], ['--spdx-version', '3.1'],
+            ['--vulnscout-cmd', '/demo/vulnscout'], ['--template', 'summary.adoc'],
+            ['--format', 'html'], ['--format', 'pdf'],
+        ]
+        with tempfile.TemporaryDirectory() as build_dir:
+            for options in cases:
+                with (
+                    self.subTest(options=options),
+                    patch.object(self.command, 'die', side_effect=fail),
+                    patch.object(self.command, '_resolve_container_engine') as engine,
+                ):
+                    with self.assertRaises(RuntimeError):
+                        self.command.do_run(self.parse('export', '-d', build_dir, *options), [])
+                    engine.assert_not_called()
+            with patch.object(self.command, 'die', side_effect=fail):
+                with self.assertRaisesRegex(RuntimeError, 'report --format'):
+                    self.command.do_run(self.parse('report', '-d', build_dir, '--format', 'spdx2'), [])
+
+    def test_export_rejects_missing_ambiguous_or_invalid_scope_without_exporting(self):
+        variant = {'name': 'native', 'id': str(vulnscout.uuid.UUID(int=1))}
+        cases = [
+            'invalid-json', '{}', '[null]',
+            '[]', '[{"name": "zephyr", "variants": []}]',
+            '[{"name": "zephyr", "variants": null}]',
+            '[{"name": "zephyr", "variants": [null]}]',
+            '[{"name": "zephyr", "variants": [{"name": "native"}]}]',
+            '[{"name": "zephyr", "variants": [{"name": "native", "id": "invalid"}]}]',
+            vulnscout.json.dumps([{'name': 'zephyr', 'variants': [variant, variant]}]),
+        ]
+        with tempfile.TemporaryDirectory() as build_dir:
+            args = self.parse('export', '-d', build_dir, '--project', 'zephyr', '--variant', 'native')
+            cache = self.command._resolve_vulnscout_data_dir(args, build_dir)
+            for output in cases:
+                with (
+                    self.subTest(output=output),
+                    patch.object(self.command, '_resolve_container_engine', return_value='podman'),
+                    patch.object(self.command, '_ensure_container_running'),
+                    patch.object(self.command, '_get_container_data_mount', return_value=cache),
+                    patch.object(self.command, 'die', side_effect=fail),
+                    patch.object(vulnscout.subprocess, 'run') as run,
+                ):
+                    run.return_value = subprocess.CompletedProcess([], 0, output, '')
+                    with self.assertRaises(RuntimeError):
+                        self.command.do_run(args, [])
+                    run.assert_called_once()
+                    self.assertIn('list-projects', run.call_args.args[0])
+
+    def test_export_scope_query_failure_is_explicit(self):
+        args = self.parse('export')
+        with (
+            patch.object(self.command, 'die', side_effect=fail),
+            patch.object(vulnscout.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'list-projects')),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'Could not resolve export scope'):
+                self.command._resolve_export_variant_id('podman', args)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -14,6 +14,9 @@ into VulnScout for vulnerability analysis.
 - `west vulnscout report`
   - Generates reports from stored results without importing or rescanning
   - Copies the selected report from the container to a host directory
+- `west vulnscout export`
+  - Exports stored variant data as SPDX 3.0, SPDX 2.3, CycloneDX, or OpenVEX
+  - Copies the exported file to a host directory without importing or rescanning
 
 ## Repository layout
 
@@ -174,6 +177,29 @@ west vulnscout report -d demo/mbedtls_sbom/build \
 ```
 
 The generated report is `reports/my-report.adoc.html`.
+
+### Export stored SBOM data
+
+```sh
+west vulnscout export -d demo/mbedtls_sbom/build \
+  --container-engine podman \
+  --project zephyr_demo --variant mbedtls_native_sim \
+  --format spdx3 --output-dir exports
+```
+
+This writes `exports/sbom_spdx_v3_0.spdx.json`. Use `--format spdx2` for SPDX 2.3,
+`cdx14`, `cdx15`, or `cdx16` for CycloneDX, or `openvex` for an OpenVEX document.
+The default format is `spdx3`; the default directory is
+`<build-dir>/vulnscout-exports`.
+
+Export uses the existing database without generating/importing an SBOM or
+running scanners. Keep the same project, variant, and cache as the original
+import; pass `--vulnscout-data-dir /path/to/existing/cache` when needed.
+Missing or ambiguous scope selections are rejected. This action requires
+direct container mode, not `--vulnscout-cmd`.
+See [Exporting SBOM Files](doc/usage/exports.md) for filenames and examples.
+
+### Container lifecycle
 
 To stop the VulnScout container cleanly after task completion:
 

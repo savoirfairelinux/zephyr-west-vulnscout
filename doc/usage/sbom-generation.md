@@ -19,6 +19,8 @@ the matching files from `<build-dir>/spdx`:
 
 Importing does not request a full vulnerability scan. See
 [Vulnerability Scanning](vulnerability-scanning.md) to run the scanners too.
+To convert stored data to SPDX 2.3, SPDX 3.0, or CycloneDX, see
+[Exporting SBOM Files](exports.md).
 
 ## Projects, variants, and cache
 

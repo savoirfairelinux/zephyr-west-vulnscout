@@ -4,6 +4,7 @@
 
 import argparse
 import glob
+import json
 import os
 import pathlib
 import shutil
@@ -30,6 +31,14 @@ VULNSCOUT_ENV_FLASK_RUN_HOST = os.environ.get(
 VULNSCOUT_ENV_FLASK_RUN_PORT = os.environ.get(
     'VULNSCOUT_ENV_FLASK_RUN_PORT', os.environ.get('FLASK_RUN_PORT', '7275')
 )
+SBOM_EXPORT_FILES = {
+    'spdx3': 'sbom_spdx_v3_0.spdx.json',
+    'spdx2': 'sbom_spdx_v2_3.spdx.json',
+    'cdx14': 'sbom_cyclonedx_v1_4.cdx.json',
+    'cdx15': 'sbom_cyclonedx_v1_5.cdx.json',
+    'cdx16': 'sbom_cyclonedx_v1_6.cdx.json',
+    'openvex': 'openvex.json',
+}
 
 
 VULNSCOUT_DESCRIPTION = """\
@@ -42,7 +51,8 @@ By default this command runs `west spdx --spdx-version 3.0`, then imports all
 storage.
 
 Use `west vulnscout report` to generate a report from the existing database
-and copy it to the host without importing or scanning again."""
+and `west vulnscout export` to export stored data as an SBOM or OpenVEX.
+Both copy their output to the host without importing or scanning again."""
 
 
 class ZephyrVulnScout(WestCommand):
@@ -77,6 +87,9 @@ class ZephyrVulnScout(WestCommand):
                 # Generate a report from the existing database:
                 west vulnscout report -d build --format html
 
+                # Export stored data as SPDX 2.3:
+                west vulnscout export -d build --format spdx2
+
                 # Request SPDX 3.1 explicitly (requires spdx-python-model v3_1):
                 west vulnscout -d build --spdx-version 3.1
             """
@@ -86,8 +99,8 @@ class ZephyrVulnScout(WestCommand):
         parser.add_argument(
             'action',
             nargs='?',
-            choices=['stop', 'report'],
-            help='stop the container, or generate a report from stored results',
+            choices=['stop', 'report', 'export'],
+            help='stop the container, generate a report, or export stored data',
         )
         parser.add_argument('-d', '--build-dir', help='Zephyr build directory')
         parser.add_argument(
@@ -208,12 +221,15 @@ class ZephyrVulnScout(WestCommand):
         )
         parser.add_argument(
             '--format',
-            choices=['html', 'pdf'],
-            help='convert an AsciiDoc report to HTML or PDF (default: template format)',
+            choices=['html', 'pdf', *SBOM_EXPORT_FILES],
+            help=(
+                'report conversion (html/pdf) or export format '
+                '(default: native template format for report, spdx3 for export)'
+            ),
         )
         parser.add_argument(
             '--output-dir',
-            help='host report directory (default: <build-dir>/vulnscout-reports)',
+            help='host output directory (default: <build-dir>/vulnscout-reports or vulnscout-exports)',
         )
 
         return parser
@@ -222,10 +238,15 @@ class ZephyrVulnScout(WestCommand):
         if unknown_args:
             self.die(f'Unexpected arguments: {unknown_args}')
 
-        if args.action != 'report' and any((args.template, args.format, args.output_dir)):
-            self.die('--template, --format, and --output-dir require `west vulnscout report`')
-        if args.action == 'report' and args.stop:
-            self.die('report cannot be combined with --stop')
+        if args.action not in ('report', 'export') and any((args.template, args.format, args.output_dir)):
+            self.die(
+                '--template, --format, and --output-dir require `west vulnscout report` '
+                'or `west vulnscout export`'
+            )
+        if args.template is not None and args.action != 'report':
+            self.die('--template requires `west vulnscout report`')
+        if args.action in ('report', 'export') and args.stop:
+            self.die(f'{args.action} cannot be combined with --stop')
 
         if args.action == 'stop' or args.stop:
             self._stop_vulnscout_container(args)
@@ -240,8 +261,11 @@ class ZephyrVulnScout(WestCommand):
         if not os.path.isdir(build_dir):
             self.die(f'Build directory does not exist: {build_dir}')
 
-        if args.action == 'report':
-            self._run_report(args, build_dir)
+        if args.action in ('report', 'export'):
+            if args.action == 'report':
+                self._run_report(args, build_dir)
+            else:
+                self._run_export(args, build_dir)
             if args.stop_after_run:
                 self._stop_vulnscout_container(args)
             return
@@ -294,20 +318,67 @@ class ZephyrVulnScout(WestCommand):
         self.die('Could not find podman or docker in PATH')
 
     def _run_report(self, args, build_dir):
+        if args.format not in (None, 'html', 'pdf'):
+            self.die('report --format must be html or pdf; use export for SBOM formats')
+        template = args.template if args.template is not None else 'summary.adoc'
+        if not template or template in ('.', '..') or pathlib.PurePosixPath(template).name != template:
+            self.die('--template must be an installed template filename, not a path')
+        if args.format and not template.endswith('.adoc'):
+            self.die('--format requires an AsciiDoc (.adoc) template')
+        filename = template + (f'.{args.format}' if args.format else '')
+        self._run_stored_output(args, build_dir, ['report', template], filename)
+
+    def _run_export(self, args, build_dir):
+        output_format = args.format or 'spdx3'
+        if output_format not in SBOM_EXPORT_FILES:
+            self.die('export --format must be spdx3, spdx2, cdx14, cdx15, cdx16, or openvex')
+        self._run_stored_output(
+            args, build_dir, ['export', '--format', output_format], SBOM_EXPORT_FILES[output_format],
+        )
+
+    def _resolve_export_variant_id(self, engine, args):
+        command = [
+            engine, 'exec', '-w', '/scan', args.container_name,
+            'flask', '--app', 'src.bin.webapp', 'list-projects', '--json',
+        ]
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            self.die(f'Could not resolve export scope: list-projects failed with exit code {e.returncode}')
+        try:
+            projects = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            self.die('Could not resolve export scope: list-projects returned invalid JSON')
+        if not isinstance(projects, list) or any(not isinstance(p, dict) for p in projects):
+            self.die('Could not resolve export scope: invalid project list')
+        project = next((p for p in projects if p.get('name') == args.project), None)
+        if project is None:
+            self.die(f'Export project "{args.project}" not found')
+        variants = project.get('variants')
+        if not isinstance(variants, list) or any(not isinstance(v, dict) for v in variants):
+            self.die('Could not resolve export scope: invalid variant list')
+        matches = [v for v in variants if v.get('name') == args.variant]
+        if len(matches) != 1:
+            self.die(f'Export variant "{args.variant}" must exist uniquely in project "{args.project}"')
+        variant_id = matches[0].get('id')
+        if not isinstance(variant_id, str):
+            self.die('Could not resolve export scope: missing variant UUID')
+        try:
+            return str(uuid.UUID(variant_id))
+        except ValueError:
+            self.die('Could not resolve export scope: invalid variant UUID')
+
+    def _run_stored_output(self, args, build_dir, parameters, filename):
+        action = args.action
         if args.vulnscout_cmd:
-            self.die('report uses direct container mode; omit --vulnscout-cmd')
+            self.die(f'{action} uses direct container mode; omit --vulnscout-cmd')
         if any((
             args.perform_scan, args.refresh_vulnerability_data, args.serve, args.dev,
             args.match_condition, args.spdx_file, args.spdx_dir, args.no_generate,
             args.include_sdk, args.analyze_includes, args.namespace_prefix,
             args.spdx_version != '3.0',
         )):
-            self.die('report cannot be combined with scan, import, refresh, or serve options')
-        template = args.template if args.template is not None else 'summary.adoc'
-        if not template or template in ('.', '..') or pathlib.PurePosixPath(template).name != template:
-            self.die('--template must be an installed template filename, not a path')
-        if args.format and not template.endswith('.adoc'):
-            self.die('--format requires an AsciiDoc (.adoc) template')
+            self.die(f'{action} cannot be combined with scan, import, refresh, or serve options')
 
         engine = self._resolve_container_engine(args.container_engine)
         data_dir = self._resolve_vulnscout_data_dir(args, build_dir)
@@ -315,45 +386,46 @@ class ZephyrVulnScout(WestCommand):
         mounted_dir = self._get_container_data_mount(engine, args.container_name)
         if not mounted_dir or os.path.realpath(mounted_dir) != os.path.realpath(data_dir):
             self.die(
-                'Report container must mount the selected cache at /cache/vulnscout. '
+                f'{action.capitalize()} container must mount the selected cache at /cache/vulnscout. '
                 'Select the matching --container-name or --vulnscout-data-dir.'
             )
 
-        report_dir = f'/tmp/vulnscout_report_{uuid.uuid4().hex}'
-        filename = template + (f'.{args.format}' if args.format else '')
+        if action == 'export':
+            scope = ['--variant-id', self._resolve_export_variant_id(engine, args)]
+        else:
+            scope = ['--project', args.project, '--variant', args.variant]
+        temporary_dir = f'/tmp/vulnscout_{action}_{uuid.uuid4().hex}'
         output_dir = os.path.abspath(
-            args.output_dir or os.path.join(build_dir, 'vulnscout-reports')
+            args.output_dir or os.path.join(build_dir, f'vulnscout-{action}s')
         )
         output_path = os.path.join(output_dir, filename)
         command = [
             engine, 'exec', '-e', 'GENERATE_DOCUMENTS=', '-w', '/scan',
             args.container_name, 'flask', '--app', 'src.bin.webapp',
-            'report', template, '--project', args.project, '--variant', args.variant,
-            '--output-dir', report_dir,
-        ]
-        if args.format:
+        ] + parameters + scope + ['--output-dir', temporary_dir]
+        if action == 'report' and args.format:
             command.extend(['--format', args.format])
-        self.inf(f'Generating VulnScout report: {quote_sh_list(command)}')
+        self.inf(f'Generating VulnScout {action}: {quote_sh_list(command)}')
         try:
             subprocess.run(command, check=True)
             os.makedirs(output_dir, exist_ok=True)
             subprocess.run([
-                engine, 'cp', f'{args.container_name}:{report_dir}/{filename}', output_path,
+                engine, 'cp', f'{args.container_name}:{temporary_dir}/{filename}', output_path,
             ], check=True)
         except subprocess.CalledProcessError as e:
             self.die(
-                f'Report generation or retrieval failed with exit code {e.returncode}. '
-                'Check the template, project/variant, and container report support.'
+                f'{action.capitalize()} generation or retrieval failed with exit code {e.returncode}. '
+                'Check the selected format/template, project/variant, and container command support.'
             )
         except OSError as e:
-            self.die(f'Could not write report output: {e}')
+            self.die(f'Could not write {action} output: {e}')
         finally:
             cleanup = subprocess.run([
-                engine, 'exec', args.container_name, 'rm', '-rf', '--', report_dir,
+                engine, 'exec', args.container_name, 'rm', '-rf', '--', temporary_dir,
             ], capture_output=True, text=True)
             if cleanup.returncode:
-                self.wrn(f'Could not remove temporary report directory {report_dir}: {cleanup.stderr}')
-        self.inf(f'Report written: {output_path}')
+                self.wrn(f'Could not remove temporary {action} directory {temporary_dir}: {cleanup.stderr}')
+        self.inf(f'{action.capitalize()} written: {output_path}')
 
     def _assert_container_running(self, engine, container_name):
         ps_cmd = [engine, 'ps', '--format', '{{.Names}}']
