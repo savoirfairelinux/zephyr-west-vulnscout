@@ -19,6 +19,12 @@ Open http://localhost:7275/ and select project `zephyr_demo`, variant
 command. Use `--no-generate --serve` to import existing SPDX files instead.
 Add `--perform-scan` to request a full vulnerability scan as well.
 
+In direct container mode, initial processing completes before the web server
+starts. Follow that initial import or scan in the terminal, not the UI. The
+processing lock is released before serving, allowing later West imports while
+the interface stays open. Wrapper mode retains VulnScout's native startup
+behavior. See {ref}`input-isolation-and-concurrent-processing`.
+
 To refresh existing data without another import, use
 [`--refresh-vulnerability-data --serve`](vulnerability-data.md).
 

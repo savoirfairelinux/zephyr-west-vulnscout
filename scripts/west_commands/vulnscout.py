@@ -2,43 +2,21 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import argparse
+from collections.abc import Sequence
 import glob
-import json
 import os
 import pathlib
-import shutil
-import subprocess
 import textwrap
-import time
 import uuid
 
 from west.commands import WestCommand
 from west.util import quote_sh_list
 
-
-# Keep defaults aligned with the VulnScout wrapper script.
-VULNSCOUT_IMAGE_REPO = os.environ.get('VULNSCOUT_IMAGE_REPO', 'docker.io/sflinux/vulnscout')
-VULNSCOUT_VERSION = (
-    os.environ.get('VULNSCOUT_VERSION')
-    or os.environ.get('VULNSCOT_VERSION')
-    or 'v0.23'
-)
-DEFAULT_VULNSCOUT_IMAGE = f'{VULNSCOUT_IMAGE_REPO}:{VULNSCOUT_VERSION}'
-VULNSCOUT_ENV_FLASK_RUN_HOST = os.environ.get(
-    'VULNSCOUT_ENV_FLASK_RUN_HOST', os.environ.get('FLASK_RUN_HOST', '0.0.0.0')
-)
-VULNSCOUT_ENV_FLASK_RUN_PORT = os.environ.get(
-    'VULNSCOUT_ENV_FLASK_RUN_PORT', os.environ.get('FLASK_RUN_PORT', '7275')
-)
-SBOM_EXPORT_FILES = {
-    'spdx3': 'sbom_spdx_v3_0.spdx.json',
-    'spdx2': 'sbom_spdx_v2_3.spdx.json',
-    'cdx14': 'sbom_cyclonedx_v1_4.cdx.json',
-    'cdx15': 'sbom_cyclonedx_v1_5.cdx.json',
-    'cdx16': 'sbom_cyclonedx_v1_6.cdx.json',
-    'openvex': 'openvex.json',
-}
+from vulnscout_helpers import container, options
+from vulnscout_helpers.process import VulnScoutError, run_command
 
 
 VULNSCOUT_DESCRIPTION = """\
@@ -55,7 +33,7 @@ Actions:
 
 
 class ZephyrVulnScout(WestCommand):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__('vulnscout', '', description=VULNSCOUT_DESCRIPTION)
 
     def do_add_parser(self, parser_adder):
@@ -193,7 +171,7 @@ class ZephyrVulnScout(WestCommand):
             help=(
                 'container image repository or repository:tag override '
                 '(when tag is omitted, VULNSCOUT_VERSION is used) '
-                f'(default: {DEFAULT_VULNSCOUT_IMAGE})'
+                f'(default: {options.DEFAULT_VULNSCOUT_IMAGE})'
             ),
         )
         container.add_argument(
@@ -248,7 +226,7 @@ class ZephyrVulnScout(WestCommand):
         )
         outputs.add_argument(
             '--format',
-            choices=['html', 'pdf', *SBOM_EXPORT_FILES],
+            choices=['html', 'pdf', *options.SBOM_EXPORT_FILES],
             help=(
                 'report: html/pdf (default: template format); '
                 'export: SBOM/OpenVEX format (default: spdx3)'
@@ -264,28 +242,22 @@ class ZephyrVulnScout(WestCommand):
 
         return parser
 
-    def do_run(self, args, unknown_args):
+    def do_run(self, args: argparse.Namespace, unknown_args: list[str]) -> None:
+        try:
+            self._run_workflow(args, unknown_args)
+        except VulnScoutError as error:
+            self.die(str(error))
+
+    def _run_workflow(self, args: argparse.Namespace, unknown_args: list[str]) -> None:
         if unknown_args:
             self.die(f'Unexpected arguments: {unknown_args}')
-
-        if args.action not in ('report', 'export') and any((args.template, args.format, args.output_dir)):
-            self.die(
-                '--template, --format, and --output-dir require `west vulnscout report` '
-                'or `west vulnscout export`'
-            )
-        if args.template is not None and args.action != 'report':
-            self.die('--template requires `west vulnscout report`')
-        if args.action in ('report', 'export') and args.stop:
-            self.die(f'{args.action} cannot be combined with --stop')
-
+        options.validate_options(args)
+        output = options.stored_output_spec(args) if args.action in ('report', 'export') else None
         if args.action == 'stop' or args.stop:
             self._stop_vulnscout_container(args)
             return
-
-        if args.match_condition is not None and not args.match_condition.strip():
-            self.die('--match-condition must not be empty')
-        if args.match_condition and args.serve:
-            self.die('--match-condition cannot be combined with --serve')
+        if not args.vulnscout_cmd:
+            options.configured_web_settings()
 
         if not args.build_dir:
             self.die('Build directory not specified; call `west vulnscout --build-dir=BUILD_DIR`')
@@ -296,21 +268,12 @@ class ZephyrVulnScout(WestCommand):
         if not os.path.isdir(build_dir):
             self.die(f'Build directory does not exist: {build_dir}')
 
-        if args.action in ('report', 'export'):
-            if args.action == 'report':
-                self._run_report(args, build_dir)
-            else:
-                self._run_export(args, build_dir)
+        if output is not None:
+            parameters, filename = output
+            self._run_stored_output(args, build_dir, parameters, filename)
             if args.stop_after_run:
                 self._stop_vulnscout_container(args)
             return
-
-        if args.serve and args.stop_after_run:
-            self.die(
-                '--stop-after-run cannot be used with --serve. '
-                '--serve keeps VulnScout attached to the terminal. '
-                'Use --serve without --stop-after-run, or run without --serve for one-shot scans.'
-            )
 
         refresh_only = args.refresh_vulnerability_data and not args.perform_scan
         spdx_files = []
@@ -325,7 +288,7 @@ class ZephyrVulnScout(WestCommand):
                     f'Expected *.jsonld, *.spdx.json, or *.spdx files.'
                 )
 
-        data_dir = self._resolve_vulnscout_data_dir(args, build_dir)
+        data_dir = options.resolve_data_dir(args, build_dir)
 
         try:
             exit_code = self._run_vulnscout(args, spdx_files, data_dir)
@@ -341,94 +304,30 @@ class ZephyrVulnScout(WestCommand):
         if exit_code == 2:
             raise SystemExit(2)
 
-    def _resolve_container_engine(self, preferred):
-        if preferred in ('docker', 'podman'):
-            if shutil.which(preferred):
-                return preferred
-            self.die(f'Requested container engine is not available: {preferred}')
-
-        # auto mode
-        for candidate in ('podman', 'docker'):
-            if shutil.which(candidate):
-                return candidate
-
-        self.die('Could not find podman or docker in PATH')
-
-    def _run_report(self, args, build_dir):
-        if args.format not in (None, 'html', 'pdf'):
-            self.die('report --format must be html or pdf; use export for SBOM formats')
-        template = args.template if args.template is not None else 'summary.adoc'
-        if not template or template in ('.', '..') or pathlib.PurePosixPath(template).name != template:
-            self.die('--template must be an installed template filename, not a path')
-        if args.format and not template.endswith('.adoc'):
-            self.die('--format requires an AsciiDoc (.adoc) template')
-        filename = template + (f'.{args.format}' if args.format else '')
-        self._run_stored_output(args, build_dir, ['report', template], filename)
-
-    def _run_export(self, args, build_dir):
-        output_format = args.format or 'spdx3'
-        if output_format not in SBOM_EXPORT_FILES:
-            self.die('export --format must be spdx3, spdx2, cdx14, cdx15, cdx16, or openvex')
-        self._run_stored_output(
-            args, build_dir, ['export', '--format', output_format], SBOM_EXPORT_FILES[output_format],
+    def _container(self, args: argparse.Namespace) -> container.Container:
+        return container.Container(
+            container.resolve_engine(args.container_engine), args.container_name,
+            info=self.inf, warn=self.wrn, debug=self.dbg,
         )
 
-    def _resolve_export_variant_id(self, engine, args):
-        command = [
-            engine, 'exec', '-w', '/scan', args.container_name,
-            'flask', '--app', 'src.bin.webapp', 'list-projects', '--json',
-        ]
-        try:
-            result = subprocess.run(command, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            self.die(f'Could not resolve export scope: list-projects failed with exit code {e.returncode}')
-        try:
-            projects = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            self.die('Could not resolve export scope: list-projects returned invalid JSON')
-        if not isinstance(projects, list) or any(not isinstance(p, dict) for p in projects):
-            self.die('Could not resolve export scope: invalid project list')
-        project = next((p for p in projects if p.get('name') == args.project), None)
-        if project is None:
-            self.die(f'Export project "{args.project}" not found')
-        variants = project.get('variants')
-        if not isinstance(variants, list) or any(not isinstance(v, dict) for v in variants):
-            self.die('Could not resolve export scope: invalid variant list')
-        matches = [v for v in variants if v.get('name') == args.variant]
-        if len(matches) != 1:
-            self.die(f'Export variant "{args.variant}" must exist uniquely in project "{args.project}"')
-        variant_id = matches[0].get('id')
-        if not isinstance(variant_id, str):
-            self.die('Could not resolve export scope: missing variant UUID')
-        try:
-            return str(uuid.UUID(variant_id))
-        except ValueError:
-            self.die('Could not resolve export scope: invalid variant UUID')
+    def _resolve_export_variant_id(self, instance: container.Container, args: argparse.Namespace) -> str:
+        command = container.container_exec(
+            instance.engine, instance.name,
+            ['flask', '--app', 'src.bin.webapp', 'list-projects', '--json'], workdir='/scan',
+        )
+        result = run_command(command, 'Could not resolve export scope: list-projects', capture_output=True)
+        return options.export_variant_id(result.stdout, args.project, args.variant)
 
-    def _run_stored_output(self, args, build_dir, parameters, filename):
+    def _run_stored_output(
+        self, args: argparse.Namespace, build_dir: str, parameters: list[str], filename: str,
+    ) -> None:
         action = args.action
-        if args.vulnscout_cmd:
-            self.die(f'{action} uses direct container mode; omit --vulnscout-cmd')
-        if any((
-            args.perform_scan, args.refresh_vulnerability_data, args.serve, args.dev,
-            args.match_condition, args.spdx_file, args.spdx_dir, args.no_generate,
-            args.include_sdk, args.analyze_includes, args.namespace_prefix,
-            args.spdx_version != '3.0',
-        )):
-            self.die(f'{action} cannot be combined with scan, import, refresh, or serve options')
-
-        engine = self._resolve_container_engine(args.container_engine)
-        data_dir = self._resolve_vulnscout_data_dir(args, build_dir)
-        self._ensure_container_running(engine, args.container_name, args, data_dir)
-        mounted_dir = self._get_container_data_mount(engine, args.container_name)
-        if not mounted_dir or os.path.realpath(mounted_dir) != os.path.realpath(data_dir):
-            self.die(
-                f'{action.capitalize()} container must mount the selected cache at /cache/vulnscout. '
-                'Select the matching --container-name or --vulnscout-data-dir.'
-            )
+        instance = self._container(args)
+        data_dir = options.resolve_data_dir(args, build_dir)
+        instance.ensure_running(data_dir, options.resolve_image(args), *options.configured_web_settings())
 
         if action == 'export':
-            scope = ['--variant-id', self._resolve_export_variant_id(engine, args)]
+            scope = ['--variant-id', self._resolve_export_variant_id(instance, args)]
         else:
             scope = ['--project', args.project, '--variant', args.variant]
         temporary_dir = f'/tmp/vulnscout_{action}_{uuid.uuid4().hex}'
@@ -436,334 +335,64 @@ class ZephyrVulnScout(WestCommand):
             args.output_dir or os.path.join(build_dir, f'vulnscout-{action}s')
         )
         output_path = os.path.join(output_dir, filename)
-        command = [
-            engine, 'exec', '-e', 'GENERATE_DOCUMENTS=', '-w', '/scan',
-            args.container_name, 'flask', '--app', 'src.bin.webapp',
-        ] + parameters + scope + ['--output-dir', temporary_dir]
+        command = container.container_exec(
+            instance.engine, instance.name,
+            ['flask', '--app', 'src.bin.webapp', *parameters, *scope, '--output-dir', temporary_dir],
+            environment={'GENERATE_DOCUMENTS': ''}, workdir='/scan',
+        )
         if action == 'report' and args.format:
             command.extend(['--format', args.format])
         self.inf(f'Generating VulnScout {action}: {quote_sh_list(command)}')
         try:
-            subprocess.run(command, check=True)
+            run_command(command, f'{action.capitalize()} generation or retrieval')
             os.makedirs(output_dir, exist_ok=True)
-            subprocess.run([
-                engine, 'cp', f'{args.container_name}:{temporary_dir}/{filename}', output_path,
-            ], check=True)
-        except subprocess.CalledProcessError as e:
-            self.die(
-                f'{action.capitalize()} generation or retrieval failed with exit code {e.returncode}. '
-                'Check the selected format/template, project/variant, and container command support.'
-            )
+            run_command([
+                instance.engine, 'cp', f'{instance.name}:{temporary_dir}/{filename}', output_path,
+            ], f'{action.capitalize()} generation or retrieval')
         except OSError as e:
-            self.die(f'Could not write {action} output: {e}')
+            raise VulnScoutError(f'Could not write {action} output: {e}') from e
         finally:
-            cleanup = subprocess.run([
-                engine, 'exec', args.container_name, 'rm', '-rf', '--', temporary_dir,
-            ], capture_output=True, text=True)
-            if cleanup.returncode:
-                self.wrn(f'Could not remove temporary {action} directory {temporary_dir}: {cleanup.stderr}')
+            instance.cleanup_directory(temporary_dir)
         self.inf(f'{action.capitalize()} written: {output_path}')
 
-    def _assert_container_running(self, engine, container_name):
-        ps_cmd = [engine, 'ps', '--format', '{{.Names}}']
-        try:
-            output = subprocess.run(ps_cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            self.die(f'Failed to query running containers with {engine}: exit code {e.returncode}')
-
-        running = output.stdout.splitlines()
-        if container_name not in running:
-            self.die(
-                f'Container "{container_name}" is not running. '
-                f'Start VulnScout first or pass --vulnscout-cmd to use the wrapper script.'
-            )
-
-    def _is_container_running(self, engine, container_name):
-        ps_cmd = [engine, 'ps', '--format', '{{.Names}}']
-        try:
-            output = subprocess.run(ps_cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            self.die(f'Failed to query running containers with {engine}: exit code {e.returncode}')
-        return container_name in output.stdout.splitlines()
-
-    def _is_container_present(self, engine, container_name):
-        ps_cmd = [engine, 'ps', '-a', '--format', '{{.Names}}']
-        try:
-            output = subprocess.run(ps_cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            self.die(f'Failed to query containers with {engine}: exit code {e.returncode}')
-        return container_name in output.stdout.splitlines()
-
-    def _wait_for_container_ready(self, engine, container_name, retries=10):
-        for _ in range(retries):
-            probe = [engine, 'exec', container_name, 'true']
-            if subprocess.run(probe, capture_output=True).returncode == 0:
-                return
-            time.sleep(1)
-        self.die(
-            f'Container "{container_name}" did not become ready. '
-            f'Check logs with: {engine} logs {container_name}'
-        )
-
-    def _resolve_vulnscout_image(self, args):
-        repo, version = self._resolve_vulnscout_repo_and_version(args)
-        return f'{repo}:{version}'
-
-    def _resolve_vulnscout_data_dir(self, args, build_dir):
-        if args.vulnscout_data_dir:
-            return os.path.abspath(args.vulnscout_data_dir)
-        return os.path.abspath(os.path.join(build_dir, '..', '.vulnscout', 'cache'))
-
-    def _resolve_vulnscout_repo_and_version(self, args):
-        repo = VULNSCOUT_IMAGE_REPO
-        version = VULNSCOUT_VERSION
-
-        if not args.vulnscout_image:
-            return repo, version
-
-        override = args.vulnscout_image.strip()
-        if not override:
-            return repo, version
-
-        # Tag separator is ':' after the last '/'.
-        last_slash = override.rfind('/')
-        last_colon = override.rfind(':')
-        if last_colon > last_slash:
-            image_repo, image_tag = override.rsplit(':', 1)
-            if image_repo and image_tag:
-                return image_repo, image_tag
-
-        return override, version
-
-    def _set_vulnscout_image_env(self, env, args):
-        repo, version = self._resolve_vulnscout_repo_and_version(args)
-        env['VULNSCOUT_IMAGE_REPO'] = repo
-        env['VULNSCOUT_VERSION'] = version
-        # Keep compatibility with wrapper scripts still reading this typo.
-        env['VULNSCOT_VERSION'] = version
-        env['VULNSCOUT_IMAGE'] = f'{repo}:{version}'
-
-    def _get_container_data_mount(self, engine, container_name):
-        inspect_cmd = [
-            engine,
-            'inspect',
-            '--format',
-            '{{range .Mounts}}{{if eq .Destination "/cache/vulnscout"}}{{.Source}}{{end}}{{end}}',
-            container_name,
-        ]
-        try:
-            output = subprocess.run(inspect_cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            self.die(f'Failed to inspect container "{container_name}": exit code {e.returncode}')
-        return output.stdout.strip()
-
-    def _web_server_settings(self):
-        host = VULNSCOUT_ENV_FLASK_RUN_HOST
-        raw_port = VULNSCOUT_ENV_FLASK_RUN_PORT
-        try:
-            port = int(raw_port)
-        except ValueError:
-            self.die('VULNSCOUT_ENV_FLASK_RUN_PORT / FLASK_RUN_PORT must be an integer between 1 and 65535')
-        if not 1 <= port <= 65535:
-            self.die('VULNSCOUT_ENV_FLASK_RUN_PORT / FLASK_RUN_PORT must be an integer between 1 and 65535')
-        if not host.strip():
-            self.die('VULNSCOUT_ENV_FLASK_RUN_HOST / FLASK_RUN_HOST must not be empty')
-        return host, str(port)
-
-    def _ensure_container_running(self, engine, container_name, args, data_dir):
-        if self._is_container_running(engine, container_name):
-            current_mount = self._get_container_data_mount(engine, container_name)
-            if not current_mount:
-                self.wrn(
-                    f'Container "{container_name}" has no /cache/vulnscout host mount; '
-                    'database is not persistent. '
-                    f'Expected mount source: {data_dir}'
-                )
-            elif os.path.abspath(current_mount) != data_dir:
-                self.wrn(
-                    f'Container "{container_name}" uses /cache/vulnscout from {current_mount} '
-                    f'instead of requested {data_dir}'
-                )
-            return
-
-        if self._is_container_present(engine, container_name):
-            current_mount = self._get_container_data_mount(engine, container_name)
-            if not current_mount:
-                self.wrn(
-                    f'Existing container "{container_name}" has no /cache/vulnscout host mount; '
-                    'database is not persistent. '
-                    f'Expected mount source: {data_dir}'
-                )
-            elif os.path.abspath(current_mount) != data_dir:
-                self.wrn(
-                    f'Existing container "{container_name}" uses /cache/vulnscout from {current_mount} '
-                    f'instead of requested {data_dir}'
-                )
-            start_cmd = [engine, 'start', container_name]
-            self.inf(f'Starting existing VulnScout container: {quote_sh_list(start_cmd)}')
-            try:
-                subprocess.run(start_cmd, check=True)
-            except subprocess.CalledProcessError as e:
-                self.die(f'Failed to start container "{container_name}": exit code {e.returncode}')
-            self._wait_for_container_ready(engine, container_name)
-            return
-
-        os.makedirs(data_dir, exist_ok=True)
-        image = self._resolve_vulnscout_image(args)
-        host, port = self._web_server_settings()
-        run_cmd = [
-            engine,
-            'run',
-            '-d',
-            '--name',
-            container_name,
-            '-p',
-            f'{port}:{port}',
-            '-e',
-            f'FLASK_RUN_HOST={host}',
-            '-e',
-            f'FLASK_RUN_PORT={port}',
-            '-v',
-            f'{data_dir}:/cache/vulnscout',
-            image,
-            'daemon',
-        ]
-        self.inf(f'Starting VulnScout container: {quote_sh_list(run_cmd)}')
-        try:
-            subprocess.run(run_cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            self.die(f'Failed to run VulnScout container from image {image}: exit code {e.returncode}')
-        self._wait_for_container_ready(engine, container_name)
-
-    def _stage_spdx_files(self, engine, container_name, spdx_files):
-        staged = []
-        for idx, spdx_file in enumerate(spdx_files, start=1):
-            src_path = pathlib.Path(spdx_file)
-            basename = src_path.name
-            if src_path.suffix.lower() == '.jsonld':
-                basename = f'{src_path.stem}.spdx.json'
-            staged_path = f'/tmp/vulnscout_stage_{idx}_{basename}'
-            cp_cmd = [engine, 'cp', spdx_file, f'{container_name}:{staged_path}']
-            self.dbg(f'Staging SPDX file into container: {quote_sh_list(cp_cmd)}')
-            try:
-                subprocess.run(cp_cmd, check=True)
-            except subprocess.CalledProcessError as e:
-                self.die(f'Failed to stage SPDX file {spdx_file}: exit code {e.returncode}')
-            staged.append(staged_path)
-        return staged
-
-    def _cleanup_staged_inputs(self, engine, container_name):
-        cleanup_cmd = [
-            engine,
-            'exec',
-            container_name,
-            'sh',
-            '-c',
-            'rm -f /scan/inputs/spdx/vulnscout_stage_* /tmp/vulnscout_stage_*',
-        ]
-        result = subprocess.run(cleanup_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            stderr = (result.stderr or '').strip()
-            if stderr:
-                self.wrn(f'Could not clean staged VulnScout inputs: {stderr}')
-
-    def _stop_vulnscout_container(self, args, best_effort=False):
+    def _stop_vulnscout_container(self, args: argparse.Namespace, best_effort: bool = False) -> None:
         if args.vulnscout_cmd:
             stop_cmd = [args.vulnscout_cmd, '--stop']
             self.inf(f'Stopping VulnScout container with wrapper: {quote_sh_list(stop_cmd)}')
             env = os.environ.copy()
-            self._set_vulnscout_image_env(env, args)
+            env.update(options.image_environment(args))
             try:
-                subprocess.run(stop_cmd, env=env, check=True)
-            except FileNotFoundError:
+                run_command(stop_cmd, 'Stopping VulnScout container with wrapper', env=env)
+            except VulnScoutError as error:
                 if best_effort:
-                    self.wrn(f'Could not find VulnScout command while stopping: {args.vulnscout_cmd}')
+                    self.wrn(str(error))
                     return
-                self.die(
-                    f'Could not find VulnScout command: {args.vulnscout_cmd}. '
-                    f'Use --vulnscout-cmd with an absolute path, or use direct exec mode.'
-                )
-            except subprocess.CalledProcessError as e:
-                if best_effort:
-                    self.wrn(f'Failed to stop VulnScout container (wrapper): exit code {e.returncode}')
-                    return
-                self.die(f'Failed to stop VulnScout container: exit code {e.returncode}')
+                raise
             return
 
-        engine = self._resolve_container_engine(args.container_engine)
-        rm_cmd = [engine, 'rm', '-f', args.container_name]
-        self.inf(f'Stopping VulnScout container: {quote_sh_list(rm_cmd)}')
-        result = subprocess.run(rm_cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            return
-        stderr = (result.stderr or '').strip()
-        stdout = (result.stdout or '').strip()
-        details = stderr or stdout
-        if 'No such container' in details:
-            self.wrn(f'Container "{args.container_name}" is not running')
-            return
-        if best_effort:
-            self.wrn(f'Failed to stop container "{args.container_name}": {details}')
-            return
-        self.die(f'Failed to stop container "{args.container_name}": {details}')
+        self._container(args).stop(best_effort)
 
-    def _run_west_spdx(self, args, build_dir, spdx_dir):
+    def _run_west_spdx(self, args: argparse.Namespace, build_dir: str, spdx_dir: str) -> None:
         requested_version = args.spdx_version
-
-        cmd = [
-            'west',
-            'spdx',
-            '--build-dir',
-            build_dir,
-            '--spdx-dir',
-            spdx_dir,
-            '--spdx-version',
-            requested_version,
-        ]
-        if args.namespace_prefix:
-            cmd.extend(['--namespace-prefix', args.namespace_prefix])
-        if args.include_sdk:
-            cmd.append('--include-sdk')
-        if args.analyze_includes:
-            cmd.append('--analyze-includes')
-
+        cmd = options.spdx_command(args, build_dir, spdx_dir, requested_version)
         self.inf(f'Generating SPDX {requested_version} SBOM with: {quote_sh_list(cmd)}')
         try:
-            subprocess.run(cmd, check=True)
+            run_command(cmd, 'west spdx')
             return
-        except subprocess.CalledProcessError as e:
-            if requested_version == '3.1':
+        except VulnScoutError as error:
+            if requested_version == '3.1' and error.returncode is not None:
                 self.wrn(
                     'west spdx failed for SPDX 3.1; retrying with SPDX 3.0. '
                     'Install a spdx-python-model build with v3_1 bindings to use SPDX 3.1.'
                 )
             else:
-                self.die(f'west spdx failed with exit code {e.returncode}')
-
-        fallback_cmd = [
-            'west',
-            'spdx',
-            '--build-dir',
-            build_dir,
-            '--spdx-dir',
-            spdx_dir,
-            '--spdx-version',
-            '3.0',
-        ]
-        if args.namespace_prefix:
-            fallback_cmd.extend(['--namespace-prefix', args.namespace_prefix])
-        if args.include_sdk:
-            fallback_cmd.append('--include-sdk')
-        if args.analyze_includes:
-            fallback_cmd.append('--analyze-includes')
+                raise
+        fallback_cmd = options.spdx_command(args, build_dir, spdx_dir, '3.0')
 
         self.inf(f'Retrying SPDX generation with: {quote_sh_list(fallback_cmd)}')
-        try:
-            subprocess.run(fallback_cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            self.die(f'west spdx failed with exit code {e.returncode}')
+        run_command(fallback_cmd, 'west spdx')
 
-    def _resolve_spdx_files(self, explicit_files, spdx_dir):
+    def _resolve_spdx_files(self, explicit_files: Sequence[str], spdx_dir: str) -> list[str]:
         resolved = []
 
         for raw_path in explicit_files:
@@ -787,86 +416,45 @@ class ZephyrVulnScout(WestCommand):
         resolved = sorted(set(os.path.abspath(p) for p in resolved if os.path.isfile(p)))
         return resolved
 
-    def _run_vulnscout(self, args, spdx_files, data_dir):
-        if args.dev and not args.vulnscout_cmd:
-            self.die(
-                '--dev is only supported with --vulnscout-cmd (wrapper mode). '
-                'Direct container exec mode calls /scan/src/entrypoint.sh, which does not support --dev.'
-            )
-
-        vulnscout_args = [
-            '--project',
-            args.project,
-            '--variant',
-            args.variant,
-        ]
-
+    def _run_vulnscout(
+        self, args: argparse.Namespace, spdx_files: Sequence[str], data_dir: str,
+    ) -> int:
+        accepted_codes = (0, 2) if args.match_condition else (0,)
         if args.vulnscout_cmd:
-            for spdx_file in spdx_files:
-                vulnscout_args.extend(['--add-spdx', spdx_file])
-        else:
-            engine = self._resolve_container_engine(args.container_engine)
-            self._ensure_container_running(engine, args.container_name, args, data_dir)
-            if spdx_files:
-                self._cleanup_staged_inputs(engine, args.container_name)
-                staged_files = self._stage_spdx_files(engine, args.container_name, spdx_files)
-                for spdx_file in staged_files:
-                    vulnscout_args.extend(['--add-spdx', spdx_file])
-
-        if args.perform_scan:
-            vulnscout_args.extend(['--perform-scans', 'all'])
-        if args.refresh_vulnerability_data:
-            vulnscout_args.append('--refresh-vulnerability-data')
-        if args.match_condition:
-            vulnscout_args.extend(['--match-condition', args.match_condition])
-        if args.serve:
-            vulnscout_args.append('--serve')
-        if args.dev:
-            vulnscout_args.append('--dev')
-
-        if args.vulnscout_cmd:
-            vulnscout_cmd = [args.vulnscout_cmd] + vulnscout_args
-        else:
-            vulnscout_cmd = [
-                engine,
-                'exec',
-            ]
+            command = [args.vulnscout_cmd, *options.processing_arguments(args, spdx_files)]
             if args.serve:
-                host, port = self._web_server_settings()
-                vulnscout_cmd.extend([
-                    '-e',
-                    f'FLASK_RUN_HOST={host}',
-                    '-e',
-                    f'FLASK_RUN_PORT={port}',
-                ])
-            vulnscout_cmd.extend([
-                args.container_name,
-                '/scan/src/entrypoint.sh',
-            ])
-            vulnscout_cmd.extend(vulnscout_args)
+                command.append('--serve')
+            if args.dev:
+                command.append('--dev')
+            env = os.environ.copy()
+            env.update(options.image_environment(args))
+            self.inf(f'Running VulnScout command: {quote_sh_list(command)}')
+            result = run_command(command, 'VulnScout', env=env, accepted_codes=accepted_codes)
+            return 2 if result.returncode == 2 else 0
 
-        env = os.environ.copy()
-        if args.vulnscout_cmd:
-            self._set_vulnscout_image_env(env, args)
-
-        if spdx_files:
-            pretty_files = ', '.join(pathlib.Path(f).name for f in spdx_files)
-            self.inf(f'Importing SPDX files into VulnScout: {pretty_files}')
-        else:
+        instance = self._container(args)
+        instance.ensure_running(data_dir, options.resolve_image(args), *options.configured_web_settings())
+        instance.check_processing_support()
+        if args.serve:
             self.inf(
-                f'Refreshing stored vulnerability data for '
-                f'project "{args.project}", variant "{args.variant}"'
+                'Processing before starting the web interface; an existing web server is left running'
             )
-        self.inf(f'Running VulnScout command: {quote_sh_list(vulnscout_cmd)}')
-        try:
-            subprocess.run(vulnscout_cmd, env=env, check=True)
-        except FileNotFoundError:
-            self.die(
-                f'Could not find VulnScout command: {args.vulnscout_cmd}. '
-                f'Use --vulnscout-cmd with an absolute path, or use direct exec mode.'
+        with instance.input_workspace() as directory:
+            staged = instance.stage_files(spdx_files, directory) if spdx_files else []
+            self.inf(f'Processing VulnScout project "{args.project}", variant "{args.variant}"')
+            exit_code = instance.run_processing(
+                options.processing_arguments(args, staged), directory, accepted_codes=accepted_codes,
             )
-        except subprocess.CalledProcessError as e:
-            if args.match_condition and e.returncode == 2:
-                return 2
-            self.die(f'VulnScout failed with exit code {e.returncode}')
-        return 0
+        if args.serve:
+            host, port = options.configured_web_settings()
+            serve_command = container.container_exec(
+                instance.engine, instance.name,
+                ['/scan/src/entrypoint.sh', '--project', args.project, '--variant', args.variant, '--serve'],
+                environment={
+                    'VULNSCOUT_INPUTS_DIR': f'{directory}/inputs',
+                    'FLASK_RUN_HOST': host, 'FLASK_RUN_PORT': port,
+                },
+            )
+            self.inf(f'Starting web interface: {quote_sh_list(serve_command)}')
+            run_command(serve_command, 'VulnScout web interface')
+        return 2 if exit_code == 2 else 0

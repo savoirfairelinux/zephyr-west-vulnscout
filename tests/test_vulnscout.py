@@ -4,13 +4,20 @@
 
 import argparse
 import contextlib
+import importlib
 import importlib.util
 import io
+import json
+import os
 import pathlib
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
+import uuid
 from unittest.mock import patch
 
 
@@ -20,7 +27,10 @@ COMMAND_PATH = (
 )
 SPEC = importlib.util.spec_from_file_location('vulnscout', COMMAND_PATH)
 vulnscout = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(vulnscout)
+with patch.object(sys, 'path', [str(COMMAND_PATH.parent), *sys.path]):
+    SPEC.loader.exec_module(vulnscout)
+
+from vulnscout_helpers import container as containers, options as config, process
 
 
 def fail(message):
@@ -29,18 +39,18 @@ def fail(message):
 
 class VulnScoutCommandTests(unittest.TestCase):
     def setUp(self):
-        web_env = patch.dict(vulnscout.os.environ)
+        web_env = patch.dict(os.environ)
         web_env.start()
         self.addCleanup(web_env.stop)
-        vulnscout.os.environ.pop('FLASK_RUN_HOST', None)
-        vulnscout.os.environ.pop('FLASK_RUN_PORT', None)
-        vulnscout.os.environ.pop('VULNSCOUT_ENV_FLASK_RUN_HOST', None)
-        vulnscout.os.environ.pop('VULNSCOUT_ENV_FLASK_RUN_PORT', None)
+        os.environ.pop('FLASK_RUN_HOST', None)
+        os.environ.pop('FLASK_RUN_PORT', None)
+        os.environ.pop('VULNSCOUT_ENV_FLASK_RUN_HOST', None)
+        os.environ.pop('VULNSCOUT_ENV_FLASK_RUN_PORT', None)
         for name, value in [
             ('VULNSCOUT_ENV_FLASK_RUN_HOST', '0.0.0.0'),
             ('VULNSCOUT_ENV_FLASK_RUN_PORT', '7275'),
         ]:
-            setting = patch.object(vulnscout, name, value)
+            setting = patch.object(config, name, value)
             setting.start()
             self.addCleanup(setting.stop)
         self.command = vulnscout.ZephyrVulnScout()
@@ -53,8 +63,77 @@ class VulnScoutCommandTests(unittest.TestCase):
     def parse(self, *arguments):
         return self.parser.parse_args(['vulnscout', *arguments])
 
+    def container(self, engine='podman', name='demo'):
+        return containers.Container(
+            engine, name, info=self.command.inf, warn=self.command.wrn, debug=self.command.dbg,
+        )
+
+    def test_west_loads_command_from_an_unrelated_working_directory(self):
+        script = """
+import argparse
+import sys
+from west.commands import _ExtFactory
+
+command = _ExtFactory(sys.argv[1], 'vulnscout', 'ZephyrVulnScout')()
+root = argparse.ArgumentParser(prog='west')
+parser = command.do_add_parser(root.add_subparsers())
+print(parser.format_help())
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [sys.executable, '-I', '-c', script, str(COMMAND_PATH)],
+                cwd=directory, capture_output=True, text=True, timeout=15,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Reports and exports', result.stdout)
+        self.assertIn('Container lifecycle', result.stdout)
+
+    def test_helpers_import_independently_without_west(self):
+        script = """
+import sys
+sys.path.insert(0, sys.argv[1])
+sys.modules['west'] = None
+from vulnscout_helpers import container, options, process
+assert options.web_server_settings('0.0.0.0', '7275') == ('0.0.0.0', '7275')
+assert container.container_exec('podman', 'demo', ['true']) == ['podman', 'exec', 'demo', 'true']
+assert issubclass(process.VulnScoutError, RuntimeError)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [sys.executable, '-I', '-c', script, str(COMMAND_PATH.parent)],
+                cwd=directory, capture_output=True, text=True, timeout=15,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_image_configuration_preserves_registry_ports_tags_and_wrapper_aliases(self):
+        for image, expected in [
+            (None, config.DEFAULT_VULNSCOUT_IMAGE),
+            (' ', config.DEFAULT_VULNSCOUT_IMAGE),
+            ('registry.example:5000/team/vulnscout', f'registry.example:5000/team/vulnscout:{config.VULNSCOUT_VERSION}'),
+            ('registry.example:5000/team/vulnscout:custom', 'registry.example:5000/team/vulnscout:custom'),
+        ]:
+            with self.subTest(image=image):
+                args = self.parse(*(['--vulnscout-image', image] if image is not None else []))
+                self.assertEqual(config.resolve_image(args), expected)
+                environment = config.image_environment(args)
+                self.assertEqual(environment['VULNSCOUT_IMAGE'], expected)
+                self.assertEqual(environment['VULNSCOUT_VERSION'], environment['VULNSCOT_VERSION'])
+
+    def test_container_engine_selection_and_errors(self):
+        for available, expected in [
+            ({'podman': '/bin/podman', 'docker': '/bin/docker'}, 'podman'),
+            ({'docker': '/bin/docker'}, 'docker'),
+        ]:
+            with self.subTest(available=available), patch.object(shutil, 'which', side_effect=available.get):
+                self.assertEqual(containers.resolve_engine('auto'), expected)
+        with patch.object(shutil, 'which', return_value=None):
+            with self.assertRaisesRegex(process.VulnScoutError, 'Requested container engine is not available'):
+                containers.resolve_engine('podman')
+            with self.assertRaisesRegex(process.VulnScoutError, 'Could not find podman or docker'):
+                containers.resolve_engine('auto')
+
     def test_help_has_a_short_synopsis_and_feature_groups(self):
-        with patch.dict(vulnscout.os.environ, {'COLUMNS': '80'}):
+        with patch.dict(os.environ, {'COLUMNS': '80'}):
             root = argparse.ArgumentParser(prog='west')
             parser = self.command.do_add_parser(root.add_subparsers())
             help_text = parser.format_help()
@@ -143,18 +222,19 @@ class VulnScoutCommandTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 args = self.parse(*arguments)
                 with (
-                    patch.object(vulnscout.shutil, 'which', return_value='/usr/bin/podman'),
-                    patch.object(vulnscout.subprocess, 'run') as run,
+                    patch.object(shutil, 'which', return_value='/usr/bin/podman'),
+                    patch.object(subprocess, 'run') as run,
                 ):
                     run.return_value = subprocess.CompletedProcess([], 0, '', '')
                     self.command.do_run(args, [])
                 run.assert_called_once_with(
-                    ['podman', 'rm', '-f', 'demo'], capture_output=True, text=True
+                    ['podman', 'rm', '-f', 'demo'],
+                    check=True, capture_output=True, text=True, env=None,
                 )
 
     def test_stop_honors_wrapper(self):
         args = self.parse('stop', '--vulnscout-cmd', '/demo/vulnscout')
-        with patch.object(vulnscout.subprocess, 'run') as run:
+        with patch.object(subprocess, 'run') as run:
             self.command.do_run(args, [])
         self.assertEqual(run.call_args.args[0], ['/demo/vulnscout', '--stop'])
         self.assertTrue(run.call_args.kwargs['check'])
@@ -177,26 +257,26 @@ class VulnScoutCommandTests(unittest.TestCase):
                             options.append('--serve')
                         args = self.parse(*options)
                         with (
-                            patch.object(self.command, '_resolve_container_engine',
+                            patch.object(containers, 'resolve_engine',
                                          return_value='podman'),
-                            patch.object(self.command, '_ensure_container_running'),
-                            patch.object(self.command, '_cleanup_staged_inputs'),
-                            patch.object(self.command, '_stage_spdx_files',
+                            patch.object(containers.Container, 'ensure_running'),
+                            patch.object(containers.Container, 'check_processing_support'),
+                            patch.object(containers.Container, 'input_workspace',
+                                         return_value=contextlib.nullcontext('/tmp/west-inputs')),
+                            patch.object(containers.Container, 'stage_files',
                                          return_value=['/tmp/app.spdx.json']),
-                            patch.object(vulnscout.subprocess, 'run') as run,
+                            patch.object(subprocess, 'run') as run,
                         ):
                             self.command._run_vulnscout(args, ['/demo/app.jsonld'], '/cache')
                         if wrapper:
                             expected = ['/demo/vulnscout']
                             spdx_file = '/demo/app.jsonld'
                         else:
-                            expected = ['podman', 'exec']
-                            if serve:
-                                expected.extend([
-                                    '-e', 'FLASK_RUN_HOST=0.0.0.0',
-                                    '-e', 'FLASK_RUN_PORT=7275',
-                                ])
-                            expected.extend(['vulnscout', '/scan/src/entrypoint.sh'])
+                            expected = [
+                                'podman', 'exec', '-e', 'VULNSCOUT_INPUTS_DIR=/tmp/west-inputs/inputs',
+                                'vulnscout', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
+                                '/cache/vulnscout/.west-vulnscout.lock', '/scan/src/entrypoint.sh',
+                            ]
                             spdx_file = '/tmp/app.spdx.json'
                         expected.extend([
                             '--project', 'demo', '--variant', 'native',
@@ -204,11 +284,19 @@ class VulnScoutCommandTests(unittest.TestCase):
                         ])
                         if perform_scan:
                             expected.extend(['--perform-scans', 'all'])
-                        if serve:
+                        if wrapper and serve:
                             expected.append('--serve')
-                        run.assert_called_once()
-                        self.assertEqual(run.call_args.args[0], expected)
+                        self.assertEqual(run.call_count, 2 if serve and not wrapper else 1)
+                        self.assertEqual(run.call_args_list[0].args[0], expected)
                         self.assertTrue(run.call_args.kwargs['check'])
+                        if serve and not wrapper:
+                            followup = run.call_args_list[1].args[0]
+                            self.assertEqual(followup[-5:], [
+                                '--project', 'demo', '--variant', 'native', '--serve',
+                            ])
+                            self.assertNotIn('--perform-scans', followup)
+                            self.assertNotIn('--add-spdx', followup)
+                            self.assertNotIn(containers.PROCESSING_LOCK_PROGRAM, followup)
 
     def test_default_action_still_generates_and_imports(self):
         with tempfile.TemporaryDirectory() as build_dir:
@@ -226,7 +314,7 @@ class VulnScoutCommandTests(unittest.TestCase):
             stop.assert_not_called()
             generate.assert_called_once_with(args, build_dir, spdx_dir)
             scan.assert_called_once_with(
-                args, files, self.command._resolve_vulnscout_data_dir(args, build_dir)
+                args, files, config.resolve_data_dir(args, build_dir)
             )
 
     def test_new_container_uses_native_web_settings(self):
@@ -235,41 +323,49 @@ class VulnScoutCommandTests(unittest.TestCase):
                 with (
                     self.subTest(engine=engine, port=port),
                     tempfile.TemporaryDirectory() as data_dir,
-                    patch.object(vulnscout, 'VULNSCOUT_ENV_FLASK_RUN_PORT', port),
-                    patch.object(self.command, '_is_container_running', return_value=False),
-                    patch.object(self.command, '_is_container_present', return_value=False),
-                    patch.object(self.command, '_wait_for_container_ready') as ready,
-                    patch.object(vulnscout.subprocess, 'run') as run,
+                    patch.object(config, 'VULNSCOUT_ENV_FLASK_RUN_PORT', port),
+                    patch.object(containers.Container, 'state', return_value=None),
+                    patch.object(containers.Container, 'data_mount', return_value=data_dir),
+                    patch.object(containers.Container, 'wait_ready') as ready,
+                    patch.object(subprocess, 'run') as run,
                 ):
                     args = self.parse('--container-name', 'web-settings')
-                    self.command._ensure_container_running(engine, args.container_name, args, data_dir)
+                    self.container(engine, args.container_name).ensure_running(
+                        data_dir, config.resolve_image(args), *config.configured_web_settings(),
+                    )
                     run.assert_called_once_with([
                         engine, 'run', '-d', '--name', 'web-settings',
                         '-p', f'{port}:{port}',
                         '-e', 'FLASK_RUN_HOST=0.0.0.0', '-e', f'FLASK_RUN_PORT={port}',
                         '-v', f'{data_dir}:/cache/vulnscout',
-                        vulnscout.DEFAULT_VULNSCOUT_IMAGE, 'daemon',
-                    ], check=True)
-                    ready.assert_called_once_with(engine, 'web-settings')
+                        config.DEFAULT_VULNSCOUT_IMAGE, 'daemon',
+                    ], check=True, capture_output=False, text=True, env=None)
+                    ready.assert_called_once_with()
 
     def test_serve_forwards_native_web_settings(self):
         for host in ['0.0.0.0', '::', '127.0.0.1']:
             with (
                 self.subTest(host=host),
-                patch.object(vulnscout, 'VULNSCOUT_ENV_FLASK_RUN_HOST', host),
-                patch.object(vulnscout, 'VULNSCOUT_ENV_FLASK_RUN_PORT', '8080'),
-                patch.object(self.command, '_resolve_container_engine', return_value='podman'),
-                patch.object(self.command, '_ensure_container_running'),
-                patch.object(vulnscout.subprocess, 'run') as run,
+                patch.object(config, 'VULNSCOUT_ENV_FLASK_RUN_HOST', host),
+                patch.object(config, 'VULNSCOUT_ENV_FLASK_RUN_PORT', '8080'),
+                patch.object(containers, 'resolve_engine', return_value='podman'),
+                patch.object(containers.Container, 'ensure_running'),
+                patch.object(containers.Container, 'check_processing_support'),
+                patch.object(containers.Container, 'input_workspace',
+                             return_value=contextlib.nullcontext('/tmp/west-inputs')),
+                patch.object(subprocess, 'run') as run,
             ):
                 args = self.parse('--serve', '--refresh-vulnerability-data')
                 self.command._run_vulnscout(args, [], '/cache')
                 self.assertEqual(run.call_args.args[0], [
-                    'podman', 'exec', '-e', f'FLASK_RUN_HOST={host}', '-e', 'FLASK_RUN_PORT=8080',
+                    'podman', 'exec', '-e', 'VULNSCOUT_INPUTS_DIR=/tmp/west-inputs/inputs',
+                    '-e', f'FLASK_RUN_HOST={host}', '-e', 'FLASK_RUN_PORT=8080',
                     'vulnscout', '/scan/src/entrypoint.sh',
                     '--project', 'default', '--variant', 'default',
-                    '--refresh-vulnerability-data', '--serve',
+                    '--serve',
                 ])
+                self.assertEqual(run.call_count, 2)
+                self.assertIn('--refresh-vulnerability-data', run.call_args_list[0].args[0])
 
     def test_invalid_native_web_settings_are_rejected(self):
         cases = [
@@ -279,11 +375,11 @@ class VulnScoutCommandTests(unittest.TestCase):
         for name, value in cases:
             with (
                 self.subTest(name=name, value=value),
-                patch.object(vulnscout, name, value),
+                patch.object(config, name, value),
                 patch.object(self.command, 'die', side_effect=fail),
             ):
                 with self.assertRaisesRegex(RuntimeError, 'FLASK_RUN_'):
-                    self.command._web_server_settings()
+                    config.configured_web_settings()
 
     def test_web_environment_defaults_aliases_and_precedence(self):
         cases = [
@@ -299,11 +395,11 @@ class VulnScoutCommandTests(unittest.TestCase):
                 'FLASK_RUN_HOST': '127.0.0.1', 'FLASK_RUN_PORT': '8080',
             }, ('0.0.0.0', '9090')),
         ]
+        self.addCleanup(importlib.reload, config)
         for settings, expected in cases:
-            with self.subTest(settings=settings), patch.dict(vulnscout.os.environ, settings):
-                module = importlib.util.module_from_spec(SPEC)
-                SPEC.loader.exec_module(module)
-                self.assertEqual(module.ZephyrVulnScout()._web_server_settings(), expected)
+            with self.subTest(settings=settings), patch.dict(os.environ, settings):
+                importlib.reload(config)
+                self.assertEqual(config.configured_web_settings(), expected)
 
     def test_refresh_only_skips_generation_and_import(self):
         for wrapper in [False, True]:
@@ -321,34 +417,34 @@ class VulnScoutCommandTests(unittest.TestCase):
                     with (
                         patch.object(self.command, '_run_west_spdx') as generate,
                         patch.object(self.command, '_resolve_spdx_files') as resolve,
-                        patch.object(self.command, '_resolve_container_engine',
+                        patch.object(containers, 'resolve_engine',
                                      return_value='podman'),
-                        patch.object(self.command, '_ensure_container_running'),
-                        patch.object(self.command, '_cleanup_staged_inputs') as cleanup,
-                        patch.object(self.command, '_stage_spdx_files') as stage,
-                        patch.object(vulnscout.subprocess, 'run') as run,
+                        patch.object(containers.Container, 'ensure_running'),
+                        patch.object(containers.Container, 'check_processing_support'),
+                        patch.object(containers.Container, 'input_workspace',
+                                     return_value=contextlib.nullcontext('/tmp/west-inputs')),
+                        patch.object(containers.Container, 'stage_files') as stage,
+                        patch.object(subprocess, 'run') as run,
                     ):
                         self.command.do_run(args, [])
                     generate.assert_not_called()
                     resolve.assert_not_called()
-                    cleanup.assert_not_called()
                     stage.assert_not_called()
                     expected = ['/demo/vulnscout'] if wrapper else ['podman', 'exec']
                     if not wrapper:
-                        if serve:
-                            expected.extend([
-                                '-e', 'FLASK_RUN_HOST=0.0.0.0',
-                                '-e', 'FLASK_RUN_PORT=7275',
-                            ])
-                        expected.extend(['vulnscout', '/scan/src/entrypoint.sh'])
+                        expected.extend([
+                            '-e', 'VULNSCOUT_INPUTS_DIR=/tmp/west-inputs/inputs',
+                            'vulnscout', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
+                            '/cache/vulnscout/.west-vulnscout.lock', '/scan/src/entrypoint.sh',
+                        ])
                     expected.extend([
                         '--project', 'demo', '--variant', 'native',
                         '--refresh-vulnerability-data',
                     ])
-                    if serve:
+                    if serve and wrapper:
                         expected.append('--serve')
-                    run.assert_called_once()
-                    self.assertEqual(run.call_args.args[0], expected)
+                    self.assertEqual(run.call_count, 2 if serve and not wrapper else 1)
+                    self.assertEqual(run.call_args_list[0].args[0], expected)
 
     def test_scan_with_refresh_still_generates_and_imports(self):
         with tempfile.TemporaryDirectory() as build_dir:
@@ -360,7 +456,7 @@ class VulnScoutCommandTests(unittest.TestCase):
             with (
                 patch.object(self.command, '_run_west_spdx') as generate,
                 patch.object(self.command, '_resolve_spdx_files', return_value=files),
-                patch.object(vulnscout.subprocess, 'run') as run,
+                patch.object(subprocess, 'run') as run,
             ):
                 self.command.do_run(args, [])
             generate.assert_called_once()
@@ -377,10 +473,13 @@ class VulnScoutCommandTests(unittest.TestCase):
             for status in [0, 1, 2]:
                 with (
                     self.subTest(wrapper=wrapper, status=status),
-                    patch.object(self.command, '_resolve_container_engine', return_value='podman'),
-                    patch.object(self.command, '_ensure_container_running'),
+                    patch.object(containers, 'resolve_engine', return_value='podman'),
+                    patch.object(containers.Container, 'ensure_running'),
+                    patch.object(containers.Container, 'check_processing_support'),
+                    patch.object(containers.Container, 'input_workspace',
+                                 return_value=contextlib.nullcontext('/tmp/west-inputs')),
                     patch.object(self.command, 'die', side_effect=fail),
-                    patch.object(vulnscout.subprocess, 'run') as run,
+                    patch.object(subprocess, 'run') as run,
                 ):
                     options = ['--match-condition', condition, '--project', 'zephyr', '--variant', 'native']
                     if wrapper:
@@ -400,10 +499,13 @@ class VulnScoutCommandTests(unittest.TestCase):
 
     def test_exit_two_without_a_match_condition_is_an_error(self):
         with (
-            patch.object(self.command, '_resolve_container_engine', return_value='podman'),
-            patch.object(self.command, '_ensure_container_running'),
+            patch.object(containers, 'resolve_engine', return_value='podman'),
+            patch.object(containers.Container, 'ensure_running'),
+            patch.object(containers.Container, 'check_processing_support'),
+            patch.object(containers.Container, 'input_workspace',
+                         return_value=contextlib.nullcontext('/tmp/west-inputs')),
             patch.object(self.command, 'die', side_effect=fail),
-            patch.object(vulnscout.subprocess, 'run', side_effect=subprocess.CalledProcessError(2, 'vulnscout')),
+            patch.object(subprocess, 'run', side_effect=subprocess.CalledProcessError(2, 'vulnscout')),
         ):
             with self.assertRaisesRegex(RuntimeError, 'exit code 2'):
                 self.command._run_vulnscout(self.parse(), [], '/cache')
@@ -435,7 +537,7 @@ class VulnScoutCommandTests(unittest.TestCase):
                         generate.assert_not_called()
                         resolve.assert_not_called()
                         scan.assert_called_once_with(
-                            args, [], self.command._resolve_vulnscout_data_dir(args, build_dir),
+                            args, [], config.resolve_data_dir(args, build_dir),
                         )
                         if stop_requested:
                             stop.assert_called_once_with(args)
@@ -486,23 +588,23 @@ class VulnScoutCommandTests(unittest.TestCase):
                     if output_format:
                         options.extend(['--format', output_format, '--output-dir', build_dir])
                     args = self.parse(*options)
-                    cache = self.command._resolve_vulnscout_data_dir(args, build_dir)
+                    cache = config.resolve_data_dir(args, build_dir)
                     report_dir = '/tmp/vulnscout_report_00000000000000000000000000000001'
                     filename = 'all_assessments.adoc' + (f'.{output_format}' if output_format else '')
                     output_dir = build_dir if output_format else str(pathlib.Path(build_dir) / 'vulnscout-reports')
                     with (
-                        patch.object(self.command, '_resolve_container_engine', return_value=engine),
-                        patch.object(self.command, '_ensure_container_running') as ensure,
-                        patch.object(self.command, '_get_container_data_mount', return_value=cache),
+                        patch.object(containers, 'resolve_engine', return_value=engine),
+                        patch.object(containers.Container, 'ensure_running') as ensure,
+                        patch.object(containers.Container, 'data_mount', return_value=cache),
                         patch.object(self.command, '_run_west_spdx') as generate,
                         patch.object(self.command, '_resolve_spdx_files') as resolve,
                         patch.object(self.command, '_run_vulnscout') as scan,
-                        patch.object(vulnscout.uuid, 'uuid4', return_value=vulnscout.uuid.UUID(int=1)),
-                        patch.object(vulnscout.subprocess, 'run') as run,
+                        patch.object(uuid, 'uuid4', return_value=uuid.UUID(int=1)),
+                        patch.object(subprocess, 'run') as run,
                     ):
                         run.return_value = subprocess.CompletedProcess([], 0, '', '')
                         self.command.do_run(args, [])
-                    ensure.assert_called_once_with(engine, 'demo', args, cache)
+                    ensure.assert_called_once_with(cache, config.DEFAULT_VULNSCOUT_IMAGE, '0.0.0.0', '7275')
                     generate.assert_not_called()
                     resolve.assert_not_called()
                     scan.assert_not_called()
@@ -529,13 +631,13 @@ class VulnScoutCommandTests(unittest.TestCase):
     def test_report_defaults_and_stop_after_success(self):
         with tempfile.TemporaryDirectory() as build_dir:
             args = self.parse('report', '-d', build_dir, '--stop-after-run')
-            cache = self.command._resolve_vulnscout_data_dir(args, build_dir)
+            cache = config.resolve_data_dir(args, build_dir)
             with (
-                patch.object(self.command, '_resolve_container_engine', return_value='podman'),
-                patch.object(self.command, '_ensure_container_running'),
-                patch.object(self.command, '_get_container_data_mount', return_value=cache),
+                patch.object(containers, 'resolve_engine', return_value='podman'),
+                patch.object(containers.Container, 'ensure_running'),
+                patch.object(containers.Container, 'data_mount', return_value=cache),
                 patch.object(self.command, '_stop_vulnscout_container') as stop,
-                patch.object(vulnscout.subprocess, 'run') as run,
+                patch.object(subprocess, 'run') as run,
             ):
                 run.return_value = subprocess.CompletedProcess([], 0, '', '')
                 self.command.do_run(args, [])
@@ -555,7 +657,7 @@ class VulnScoutCommandTests(unittest.TestCase):
                 with (
                     self.subTest(options=options),
                     patch.object(self.command, 'die', side_effect=fail) as die,
-                    patch.object(self.command, '_resolve_container_engine') as engine,
+                    patch.object(containers, 'resolve_engine') as engine,
                 ):
                     with self.assertRaises(RuntimeError):
                         self.command.do_run(self.parse('report', '-d', build_dir, *options), [])
@@ -578,11 +680,11 @@ class VulnScoutCommandTests(unittest.TestCase):
             for mounted_dir in ['', '/another/cache']:
                 with (
                     self.subTest(mount=mounted_dir),
-                    patch.object(self.command, '_resolve_container_engine', return_value='podman'),
-                    patch.object(self.command, '_ensure_container_running'),
-                    patch.object(self.command, '_get_container_data_mount', return_value=mounted_dir),
+                    patch.object(containers, 'resolve_engine', return_value='podman'),
+                    patch.object(containers.Container, 'state', return_value='running'),
+                    patch.object(containers.Container, 'data_mount', return_value=mounted_dir),
                     patch.object(self.command, 'die', side_effect=fail),
-                    patch.object(vulnscout.subprocess, 'run') as run,
+                    patch.object(subprocess, 'run') as run,
                 ):
                     with self.assertRaisesRegex(RuntimeError, 'must mount the selected cache'):
                         self.command.do_run(self.parse('report', '-d', build_dir), [])
@@ -592,19 +694,19 @@ class VulnScoutCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as build_dir:
             for fail_copy in [False, True]:
                 args = self.parse('report', '-d', build_dir, '--stop-after-run')
-                cache = self.command._resolve_vulnscout_data_dir(args, build_dir)
+                cache = config.resolve_data_dir(args, build_dir)
                 success = subprocess.CompletedProcess([], 0, '', '')
                 results = ([success] if fail_copy else []) + [
                     subprocess.CalledProcessError(1, 'report'), success,
                 ]
                 with (
                     self.subTest(fail_copy=fail_copy),
-                    patch.object(self.command, '_resolve_container_engine', return_value='podman'),
-                    patch.object(self.command, '_ensure_container_running'),
-                    patch.object(self.command, '_get_container_data_mount', return_value=cache),
+                    patch.object(containers, 'resolve_engine', return_value='podman'),
+                    patch.object(containers.Container, 'ensure_running'),
+                    patch.object(containers.Container, 'data_mount', return_value=cache),
                     patch.object(self.command, '_stop_vulnscout_container') as stop,
                     patch.object(self.command, 'die', side_effect=fail),
-                    patch.object(vulnscout.subprocess, 'run', side_effect=results) as run,
+                    patch.object(subprocess, 'run', side_effect=results) as run,
                 ):
                     with self.assertRaisesRegex(RuntimeError, 'generation or retrieval failed'):
                         self.command.do_run(args, [])
@@ -615,14 +717,14 @@ class VulnScoutCommandTests(unittest.TestCase):
     def test_report_output_errors_are_explicit_and_clean_up(self):
         with tempfile.TemporaryDirectory() as build_dir:
             args = self.parse('report', '-d', build_dir)
-            cache = self.command._resolve_vulnscout_data_dir(args, build_dir)
+            cache = config.resolve_data_dir(args, build_dir)
             with (
-                patch.object(self.command, '_resolve_container_engine', return_value='podman'),
-                patch.object(self.command, '_ensure_container_running'),
-                patch.object(self.command, '_get_container_data_mount', return_value=cache),
+                patch.object(containers, 'resolve_engine', return_value='podman'),
+                patch.object(containers.Container, 'ensure_running'),
+                patch.object(containers.Container, 'data_mount', return_value=cache),
                 patch.object(self.command, 'die', side_effect=fail),
-                patch.object(vulnscout.os, 'makedirs', side_effect=OSError('read-only output')),
-                patch.object(vulnscout.subprocess, 'run') as run,
+                patch.object(os, 'makedirs', side_effect=OSError('read-only output')),
+                patch.object(subprocess, 'run') as run,
             ):
                 run.return_value = subprocess.CompletedProcess([], 0, '', '')
                 with self.assertRaisesRegex(RuntimeError, 'Could not write report output: read-only output'):
@@ -633,16 +735,16 @@ class VulnScoutCommandTests(unittest.TestCase):
     def test_report_cleanup_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as build_dir:
             args = self.parse('report', '-d', build_dir)
-            cache = self.command._resolve_vulnscout_data_dir(args, build_dir)
+            cache = config.resolve_data_dir(args, build_dir)
             with (
-                patch.object(self.command, '_resolve_container_engine', return_value='podman'),
-                patch.object(self.command, '_ensure_container_running'),
-                patch.object(self.command, '_get_container_data_mount', return_value=cache),
+                patch.object(containers, 'resolve_engine', return_value='podman'),
+                patch.object(containers.Container, 'ensure_running'),
+                patch.object(containers.Container, 'data_mount', return_value=cache),
                 patch.object(self.command, 'wrn') as warning,
-                patch.object(vulnscout.subprocess, 'run', side_effect=[
+                patch.object(subprocess, 'run', side_effect=[
                     subprocess.CompletedProcess([], 0),
                     subprocess.CompletedProcess([], 0),
-                    subprocess.CompletedProcess([], 1, '', 'permission denied'),
+                    subprocess.CalledProcessError(1, 'rm', stderr='permission denied'),
                 ]),
             ):
                 self.command.do_run(args, [])
@@ -652,11 +754,11 @@ class VulnScoutCommandTests(unittest.TestCase):
     def test_export_formats_skip_import_and_copy_only_the_scoped_output(self):
         selected_id = '00000000-0000-0000-0000-000000000002'
         projects = [
-            {'name': 'other', 'variants': [{'name': 'native', 'id': str(vulnscout.uuid.UUID(int=3))}]},
+            {'name': 'other', 'variants': [{'name': 'native', 'id': str(uuid.UUID(int=3))}]},
             {'name': 'zephyr', 'variants': [{'name': 'native', 'id': selected_id}]},
         ]
         for engine in ['podman', 'docker']:
-            for output_format, filename in vulnscout.SBOM_EXPORT_FILES.items():
+            for output_format, filename in config.SBOM_EXPORT_FILES.items():
                 with (
                     self.subTest(engine=engine, format=output_format),
                     tempfile.TemporaryDirectory() as build_dir,
@@ -666,23 +768,23 @@ class VulnScoutCommandTests(unittest.TestCase):
                         '--container-name', 'demo', '--project', 'zephyr', '--variant', 'native',
                         '--format', output_format, '--output-dir', build_dir,
                     )
-                    cache = self.command._resolve_vulnscout_data_dir(args, build_dir)
+                    cache = config.resolve_data_dir(args, build_dir)
                     temporary_dir = '/tmp/vulnscout_export_00000000000000000000000000000001'
                     with (
-                        patch.object(self.command, '_resolve_container_engine', return_value=engine),
-                        patch.object(self.command, '_ensure_container_running') as ensure,
-                        patch.object(self.command, '_get_container_data_mount', return_value=cache),
+                        patch.object(containers, 'resolve_engine', return_value=engine),
+                        patch.object(containers.Container, 'ensure_running') as ensure,
+                        patch.object(containers.Container, 'data_mount', return_value=cache),
                         patch.object(self.command, '_run_west_spdx') as generate,
                         patch.object(self.command, '_resolve_spdx_files') as resolve,
                         patch.object(self.command, '_run_vulnscout') as scan,
-                        patch.object(vulnscout.uuid, 'uuid4', return_value=vulnscout.uuid.UUID(int=1)),
-                        patch.object(vulnscout.subprocess, 'run') as run,
+                        patch.object(uuid, 'uuid4', return_value=uuid.UUID(int=1)),
+                        patch.object(subprocess, 'run') as run,
                     ):
                         run.return_value = subprocess.CompletedProcess(
-                            [], 0, vulnscout.json.dumps(projects), '',
+                            [], 0, json.dumps(projects), '',
                         )
                         self.command.do_run(args, [])
-                    ensure.assert_called_once_with(engine, 'demo', args, cache)
+                    ensure.assert_called_once_with(cache, config.DEFAULT_VULNSCOUT_IMAGE, '0.0.0.0', '7275')
                     generate.assert_not_called()
                     resolve.assert_not_called()
                     scan.assert_not_called()
@@ -710,14 +812,14 @@ class VulnScoutCommandTests(unittest.TestCase):
     def test_export_defaults_to_spdx3_and_stops_after_success(self):
         with tempfile.TemporaryDirectory() as build_dir:
             args = self.parse('export', '-d', build_dir, '--stop-after-run')
-            cache = self.command._resolve_vulnscout_data_dir(args, build_dir)
+            cache = config.resolve_data_dir(args, build_dir)
             with (
-                patch.object(self.command, '_resolve_container_engine', return_value='podman'),
-                patch.object(self.command, '_ensure_container_running'),
-                patch.object(self.command, '_get_container_data_mount', return_value=cache),
-                patch.object(self.command, '_resolve_export_variant_id', return_value=str(vulnscout.uuid.UUID(int=1))),
+                patch.object(containers, 'resolve_engine', return_value='podman'),
+                patch.object(containers.Container, 'ensure_running'),
+                patch.object(containers.Container, 'data_mount', return_value=cache),
+                patch.object(self.command, '_resolve_export_variant_id', return_value=str(uuid.UUID(int=1))),
                 patch.object(self.command, '_stop_vulnscout_container') as stop,
-                patch.object(vulnscout.subprocess, 'run') as run,
+                patch.object(subprocess, 'run') as run,
             ):
                 run.return_value = subprocess.CompletedProcess([], 0, '', '')
                 self.command.do_run(args, [])
@@ -739,7 +841,7 @@ class VulnScoutCommandTests(unittest.TestCase):
                 with (
                     self.subTest(options=options),
                     patch.object(self.command, 'die', side_effect=fail),
-                    patch.object(self.command, '_resolve_container_engine') as engine,
+                    patch.object(containers, 'resolve_engine') as engine,
                 ):
                     with self.assertRaises(RuntimeError):
                         self.command.do_run(self.parse('export', '-d', build_dir, *options), [])
@@ -749,7 +851,7 @@ class VulnScoutCommandTests(unittest.TestCase):
                     self.command.do_run(self.parse('report', '-d', build_dir, '--format', 'spdx2'), [])
 
     def test_export_rejects_missing_ambiguous_or_invalid_scope_without_exporting(self):
-        variant = {'name': 'native', 'id': str(vulnscout.uuid.UUID(int=1))}
+        variant = {'name': 'native', 'id': str(uuid.UUID(int=1))}
         cases = [
             'invalid-json', '{}', '[null]',
             '[]', '[{"name": "zephyr", "variants": []}]',
@@ -757,19 +859,19 @@ class VulnScoutCommandTests(unittest.TestCase):
             '[{"name": "zephyr", "variants": [null]}]',
             '[{"name": "zephyr", "variants": [{"name": "native"}]}]',
             '[{"name": "zephyr", "variants": [{"name": "native", "id": "invalid"}]}]',
-            vulnscout.json.dumps([{'name': 'zephyr', 'variants': [variant, variant]}]),
+            json.dumps([{'name': 'zephyr', 'variants': [variant, variant]}]),
         ]
         with tempfile.TemporaryDirectory() as build_dir:
             args = self.parse('export', '-d', build_dir, '--project', 'zephyr', '--variant', 'native')
-            cache = self.command._resolve_vulnscout_data_dir(args, build_dir)
+            cache = config.resolve_data_dir(args, build_dir)
             for output in cases:
                 with (
                     self.subTest(output=output),
-                    patch.object(self.command, '_resolve_container_engine', return_value='podman'),
-                    patch.object(self.command, '_ensure_container_running'),
-                    patch.object(self.command, '_get_container_data_mount', return_value=cache),
+                    patch.object(containers, 'resolve_engine', return_value='podman'),
+                    patch.object(containers.Container, 'ensure_running'),
+                    patch.object(containers.Container, 'data_mount', return_value=cache),
                     patch.object(self.command, 'die', side_effect=fail),
-                    patch.object(vulnscout.subprocess, 'run') as run,
+                    patch.object(subprocess, 'run') as run,
                 ):
                     run.return_value = subprocess.CompletedProcess([], 0, output, '')
                     with self.assertRaises(RuntimeError):
@@ -781,10 +883,219 @@ class VulnScoutCommandTests(unittest.TestCase):
         args = self.parse('export')
         with (
             patch.object(self.command, 'die', side_effect=fail),
-            patch.object(vulnscout.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'list-projects')),
+            patch.object(subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'list-projects')),
         ):
             with self.assertRaisesRegex(RuntimeError, 'Could not resolve export scope'):
-                self.command._resolve_export_variant_id('podman', args)
+                self.command._resolve_export_variant_id(self.container(), args)
+
+    def test_cache_is_checked_before_starting_or_reusing_container(self):
+        for state in ['running', 'exited']:
+            for mount in ['', '/another/cache']:
+                with (
+                    self.subTest(state=state, mount=mount),
+                    patch.object(containers.Container, 'state', return_value=state),
+                    patch.object(containers.Container, 'data_mount', return_value=mount),
+                    patch.object(subprocess, 'run') as run,
+                ):
+                    with self.assertRaisesRegex(process.VulnScoutError, 'must mount the selected cache'):
+                        self.container().ensure_running('/selected/cache', 'sfl:custom', '0.0.0.0', '7275')
+                    run.assert_not_called()
+
+    def test_symlink_equivalent_cache_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = pathlib.Path(directory) / 'cache'
+            cache.mkdir()
+            alias = pathlib.Path(directory) / 'alias'
+            alias.symlink_to(cache, target_is_directory=True)
+            containers.validate_cache_mount(str(alias), str(cache))
+            with (
+                patch.object(containers.Container, 'state', return_value='exited'),
+                patch.object(containers.Container, 'data_mount', return_value=str(alias)),
+                patch.object(containers.Container, 'wait_ready'),
+                patch.object(subprocess, 'run') as run,
+            ):
+                self.container().ensure_running(str(cache), 'sfl:custom', '0.0.0.0', '7275')
+                self.assertEqual(run.call_args.args[0], ['podman', 'start', 'demo'])
+
+    def test_container_state_uses_one_query_and_exact_names(self):
+        for output, expected in [
+            ('vulnscout-other\trunning\nvulnscout\texited\n', 'exited'),
+            ('vulnscout-other\trunning\n', None), ('', None),
+        ]:
+            with (
+                self.subTest(output=output),
+                patch.object(subprocess, 'run',
+                             return_value=subprocess.CompletedProcess([], 0, output, '')) as run,
+            ):
+                self.assertEqual(self.container(name='vulnscout').state(), expected)
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0], [
+                    'podman', 'ps', '-a', '--format', '{{.Names}}\t{{.State}}',
+                ])
+        with patch.object(subprocess, 'run',
+                          return_value=subprocess.CompletedProcess([], 0, 'unexpected', '')):
+            with self.assertRaisesRegex(process.VulnScoutError, 'Invalid container status'):
+                self.container(name='vulnscout').state()
+
+    def test_private_workspace_is_unique_and_cleans_only_owned_paths(self):
+        with patch.object(subprocess, 'run') as run:
+            with self.container().input_workspace() as first:
+                self.assertTrue(first.startswith('/tmp/west_vulnscout_'))
+            with self.container().input_workspace() as second:
+                self.assertNotEqual(first, second)
+            self.assertEqual(run.call_count, 4)
+            for call, directory in zip(run.call_args_list[1::2], [first, second]):
+                self.assertEqual(call.args[0], ['podman', 'exec', 'demo', 'rm', '-rf', '--', directory])
+
+    def test_processing_cleans_owned_workspace_for_all_native_exit_statuses(self):
+        success = subprocess.CompletedProcess([], 0, '', '')
+        for status, message in [(0, None), (2, None), (1, 'VulnScout failed'), (75, 'processing this cache')]:
+            result = success if status == 0 else subprocess.CalledProcessError(status, 'entrypoint')
+            with (
+                self.subTest(status=status),
+                patch.object(containers, 'resolve_engine', return_value='podman'),
+                patch.object(containers.Container, 'ensure_running'),
+                patch.object(containers.Container, 'check_processing_support'),
+                patch.object(subprocess, 'run', side_effect=[success, success, result, success]) as run,
+            ):
+                args = self.parse('--match-condition', 'cvss >= 9')
+                if message:
+                    with self.assertRaisesRegex(process.VulnScoutError, message):
+                        self.command._run_vulnscout(args, ['/host/app.jsonld'], '/cache')
+                else:
+                    self.assertEqual(self.command._run_vulnscout(args, ['/host/app.jsonld'], '/cache'), status)
+                self.assertEqual(run.call_count, 4)
+                directory = run.call_args_list[0].args[0][-1].removesuffix('/staged')
+                self.assertEqual(run.call_args_list[1].args[0], [
+                    'podman', 'cp', '/host/app.jsonld', f'vulnscout:{directory}/staged/1_app.spdx.json',
+                ])
+                command = run.call_args_list[2].args[0]
+                self.assertIn(f'VULNSCOUT_INPUTS_DIR={directory}/inputs', command)
+                self.assertEqual(command[5:10], [
+                    'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
+                    containers.PROCESSING_LOCK, '/scan/src/entrypoint.sh',
+                ])
+                self.assertEqual(run.call_args.args[0][-4:], ['rm', '-rf', '--', directory])
+
+    def test_partial_copy_failure_cleans_workspace_without_processing(self):
+        success = subprocess.CompletedProcess([], 0, '', '')
+        with (
+            patch.object(containers, 'resolve_engine', return_value='podman'),
+            patch.object(containers.Container, 'ensure_running'),
+            patch.object(containers.Container, 'check_processing_support'),
+            patch.object(subprocess, 'run', side_effect=[
+                success, success, subprocess.CalledProcessError(1, 'cp'), success,
+            ]) as run,
+        ):
+            with self.assertRaisesRegex(process.VulnScoutError, 'Staging SPDX file /host/build.jsonld'):
+                self.command._run_vulnscout(self.parse(), ['/host/app.jsonld', '/host/build.jsonld'], '/cache')
+            self.assertEqual(run.call_count, 4)
+            self.assertEqual(run.call_args.args[0][3:6], ['rm', '-rf', '--'])
+            self.assertFalse(any(containers.PROCESSING_LOCK_PROGRAM in call.args[0] for call in run.call_args_list))
+
+    def test_cleanup_failure_does_not_mask_processing_failure(self):
+        with (
+            patch.object(self.command, 'wrn') as warning,
+            patch.object(subprocess, 'run', side_effect=[
+                subprocess.CompletedProcess([], 0, '', ''),
+                subprocess.CalledProcessError(1, 'rm', stderr='permission denied'),
+            ]),
+        ):
+            with self.assertRaisesRegex(process.VulnScoutError, 'primary processing failure'):
+                with self.container().input_workspace():
+                    raise process.VulnScoutError('primary processing failure')
+            warning.assert_called_once()
+            self.assertIn('permission denied', warning.call_args.args[0])
+
+    @unittest.skipUnless(os.name == 'posix', 'container lock uses POSIX fcntl')
+    def test_lock_survives_exec_and_releases_for_all_processing_statuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = pathlib.Path(directory) / 'ready'
+            command = [
+                sys.executable, '-c', containers.PROCESSING_LOCK_PROGRAM,
+                str(pathlib.Path(directory) / 'lock'), sys.executable, '-c',
+            ]
+            with subprocess.Popen([
+                *command, 'import pathlib, sys; pathlib.Path(sys.argv[1]).touch(); sys.stdin.read(1)',
+                str(marker),
+            ], stdin=subprocess.PIPE, text=True) as owner:
+                try:
+                    deadline = time.monotonic() + 5
+                    while not marker.exists() and time.monotonic() < deadline:
+                        self.assertIsNone(owner.poll())
+                        time.sleep(0.01)
+                    self.assertTrue(marker.exists())
+                    self.assertEqual(subprocess.run(
+                        [*command, 'raise SystemExit(0)'], timeout=5,
+                    ).returncode, containers.LOCK_BUSY)
+                finally:
+                    owner.communicate(input='x', timeout=5)
+                self.assertEqual(owner.returncode, 0)
+            for status in [2, 1, 0]:
+                self.assertEqual(subprocess.run(
+                    [*command, f'raise SystemExit({status})'], timeout=5,
+                ).returncode, status)
+
+    def test_incompatible_image_is_rejected_before_staging(self):
+        with (
+            patch.object(containers, 'resolve_engine', return_value='podman'),
+            patch.object(containers.Container, 'ensure_running'),
+            patch.object(containers.Container, 'input_workspace') as workspace,
+            patch.object(containers.Container, 'stage_files') as stage,
+            patch.object(subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'probe')),
+        ):
+            with self.assertRaisesRegex(process.VulnScoutError, 'requires Python fcntl and VULNSCOUT_INPUTS_DIR'):
+                self.command._run_vulnscout(self.parse(), ['/host/app.jsonld'], '/cache')
+            workspace.assert_not_called()
+            stage.assert_not_called()
+
+    def test_invalid_direct_options_are_rejected_before_generation(self):
+        for options in [('--dev',), ('--serve', '--stop-after-run'), ('--match-condition', ' ')]:
+            with (
+                self.subTest(options=options),
+                patch.object(self.command, 'die', side_effect=fail),
+                patch.object(self.command, '_run_west_spdx') as generate,
+                patch.object(subprocess, 'run') as run,
+            ):
+                with self.assertRaises(RuntimeError):
+                    self.command.do_run(self.parse(*options), [])
+                generate.assert_not_called()
+                run.assert_not_called()
+
+    def test_command_runner_reports_stderr_and_expected_policy_status(self):
+        with patch.object(subprocess, 'run',
+                          side_effect=subprocess.CalledProcessError(1, 'query', stderr='permission denied')):
+            with self.assertRaisesRegex(process.VulnScoutError, 'Query failed with exit code 1: permission denied'):
+                process.run_command(['engine', 'query'], 'Query', capture_output=True)
+        with patch.object(subprocess, 'run', side_effect=FileNotFoundError('not installed')):
+            with self.assertRaisesRegex(process.VulnScoutError, 'could not execute engine'):
+                process.run_command(['engine', 'query'], 'Query')
+        with patch.object(subprocess, 'run', side_effect=subprocess.CalledProcessError(2, 'policy')):
+            self.assertEqual(process.run_command(['policy'], 'Policy', accepted_codes=(0, 2)).returncode, 2)
+            with self.assertRaises(process.VulnScoutError):
+                process.run_command(['policy'], 'Policy')
+
+    def test_readiness_uses_common_diagnostics(self):
+        with (
+            patch.object(time, 'sleep'),
+            patch.object(subprocess, 'run',
+                         side_effect=subprocess.CalledProcessError(125, 'exec', stderr='container exited')) as run,
+        ):
+            with self.assertRaisesRegex(process.VulnScoutError, 'Last error: .*container exited'):
+                self.container().wait_ready(retries=2)
+            self.assertEqual(run.call_count, 2)
+
+    def test_command_builders_preserve_arguments_without_shell_parsing(self):
+        args = self.parse('--namespace-prefix', 'https://example.org/my sbom',
+                          '--include-sdk', '--analyze-includes')
+        self.assertEqual(config.spdx_command(args, '/my build', '/my spdx', '3.1'), [
+            'west', 'spdx', '--build-dir', '/my build', '--spdx-dir', '/my spdx',
+            '--spdx-version', '3.1', '--namespace-prefix', 'https://example.org/my sbom',
+            '--include-sdk', '--analyze-includes',
+        ])
+        self.assertEqual(containers.container_exec(
+            'podman', 'demo', ['command', 'one argument'], environment={'KEY': 'a b'}, workdir='/my dir',
+        ), ['podman', 'exec', '-e', 'KEY=a b', '-w', '/my dir', 'demo', 'command', 'one argument'])
 
 
 if __name__ == '__main__':

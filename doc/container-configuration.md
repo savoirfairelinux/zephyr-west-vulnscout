@@ -30,8 +30,36 @@ podman inspect vulnscout \
 ```
 
 Use that host path as `--vulnscout-data-dir` when continuing the workflow.
-Imports and refreshes warn if an existing container uses a different cache;
-report generation refuses the mismatch.
+All direct-mode imports, refreshes, reports, and exports refuse a different
+or missing cache mount. Paths resolving to the same location, including
+symlinks, are accepted. A stopped container's mount is checked before it is
+started; a running container is not modified to switch caches.
+
+(input-isolation-and-concurrent-processing)=
+## Input isolation and concurrent processing
+
+Each direct-mode processing invocation stages its files and native inputs in
+a unique temporary directory inside the container. Only that directory is
+removed afterward, including after a failed copy, processing error, or policy
+match. Files pending in VulnScout's shared input directory are neither imported
+nor deleted by the invocation.
+
+Processing uses a nonblocking `flock` lock at
+`/cache/vulnscout/.west-vulnscout.lock`. If another West invocation is processing
+the same cache, the command fails immediately with an error asking you to retry.
+This also coordinates participating containers mounting the same host cache.
+The lock file may remain after processing; its presence does not mean the lock
+is held. Do not delete it to clear a busy error.
+
+The image must provide Python with the standard `fcntl` module and an entrypoint
+supporting `VULNSCOUT_INPUTS_DIR`. Compatibility is checked before staging files;
+unsupported images fail explicitly rather than falling back to shared inputs.
+
+Direct-mode `--serve` starts the UI after processing and releasing the lock,
+so later West imports can run while the interface remains open. These guarantees
+apply to direct West processing, not wrapper commands, API requests, or other
+native VulnScout clients. Coordinate those writers separately, and do not
+override `INPUTS_DIR` in a mounted configuration file.
 
 ## Image selection
 
@@ -80,5 +108,6 @@ ZEPHYR_BASE="$PWD/zephyr" west vulnscout \
   --serve --dev
 ```
 
-`--dev` is supported only in wrapper mode. The `report` action requires direct
-container mode and rejects `--vulnscout-cmd`.
+`--dev` is supported only in wrapper mode. The `report` and `export` actions
+require direct container mode and reject `--vulnscout-cmd`. The wrapper retains
+its own cache, input, concurrency, and interactive-mode behavior.
