@@ -24,6 +24,12 @@ VULNSCOUT_VERSION = (
     or 'v0.23'
 )
 DEFAULT_VULNSCOUT_IMAGE = f'{VULNSCOUT_IMAGE_REPO}:{VULNSCOUT_VERSION}'
+VULNSCOUT_ENV_FLASK_RUN_HOST = os.environ.get(
+    'VULNSCOUT_ENV_FLASK_RUN_HOST', os.environ.get('FLASK_RUN_HOST', '0.0.0.0')
+)
+VULNSCOUT_ENV_FLASK_RUN_PORT = os.environ.get(
+    'VULNSCOUT_ENV_FLASK_RUN_PORT', os.environ.get('FLASK_RUN_PORT', '7275')
+)
 
 
 VULNSCOUT_DESCRIPTION = """\
@@ -442,6 +448,19 @@ class ZephyrVulnScout(WestCommand):
             self.die(f'Failed to inspect container "{container_name}": exit code {e.returncode}')
         return output.stdout.strip()
 
+    def _web_server_settings(self):
+        host = VULNSCOUT_ENV_FLASK_RUN_HOST
+        raw_port = VULNSCOUT_ENV_FLASK_RUN_PORT
+        try:
+            port = int(raw_port)
+        except ValueError:
+            self.die('VULNSCOUT_ENV_FLASK_RUN_PORT / FLASK_RUN_PORT must be an integer between 1 and 65535')
+        if not 1 <= port <= 65535:
+            self.die('VULNSCOUT_ENV_FLASK_RUN_PORT / FLASK_RUN_PORT must be an integer between 1 and 65535')
+        if not host.strip():
+            self.die('VULNSCOUT_ENV_FLASK_RUN_HOST / FLASK_RUN_HOST must not be empty')
+        return host, str(port)
+
     def _ensure_container_running(self, engine, container_name, args, data_dir):
         if self._is_container_running(engine, container_name):
             current_mount = self._get_container_data_mount(engine, container_name)
@@ -482,6 +501,7 @@ class ZephyrVulnScout(WestCommand):
 
         os.makedirs(data_dir, exist_ok=True)
         image = self._resolve_vulnscout_image(args)
+        host, port = self._web_server_settings()
         run_cmd = [
             engine,
             'run',
@@ -489,7 +509,11 @@ class ZephyrVulnScout(WestCommand):
             '--name',
             container_name,
             '-p',
-            '7275:7275',
+            f'{port}:{port}',
+            '-e',
+            f'FLASK_RUN_HOST={host}',
+            '-e',
+            f'FLASK_RUN_PORT={port}',
             '-v',
             f'{data_dir}:/cache/vulnscout',
             image,
@@ -699,11 +723,12 @@ class ZephyrVulnScout(WestCommand):
                 'exec',
             ]
             if args.serve:
+                host, port = self._web_server_settings()
                 vulnscout_cmd.extend([
                     '-e',
-                    'FLASK_RUN_HOST=0.0.0.0',
+                    f'FLASK_RUN_HOST={host}',
                     '-e',
-                    'FLASK_RUN_PORT=7275',
+                    f'FLASK_RUN_PORT={port}',
                 ])
             vulnscout_cmd.extend([
                 args.container_name,

@@ -28,6 +28,20 @@ def fail(message):
 
 class VulnScoutCommandTests(unittest.TestCase):
     def setUp(self):
+        web_env = patch.dict(vulnscout.os.environ)
+        web_env.start()
+        self.addCleanup(web_env.stop)
+        vulnscout.os.environ.pop('FLASK_RUN_HOST', None)
+        vulnscout.os.environ.pop('FLASK_RUN_PORT', None)
+        vulnscout.os.environ.pop('VULNSCOUT_ENV_FLASK_RUN_HOST', None)
+        vulnscout.os.environ.pop('VULNSCOUT_ENV_FLASK_RUN_PORT', None)
+        for name, value in [
+            ('VULNSCOUT_ENV_FLASK_RUN_HOST', '0.0.0.0'),
+            ('VULNSCOUT_ENV_FLASK_RUN_PORT', '7275'),
+        ]:
+            setting = patch.object(vulnscout, name, value)
+            setting.start()
+            self.addCleanup(setting.stop)
         self.command = vulnscout.ZephyrVulnScout()
         info = patch.object(self.command, 'inf')
         info.start()
@@ -146,6 +160,82 @@ class VulnScoutCommandTests(unittest.TestCase):
             scan.assert_called_once_with(
                 args, files, self.command._resolve_vulnscout_data_dir(args, build_dir)
             )
+
+    def test_new_container_uses_native_web_settings(self):
+        for engine in ['podman', 'docker']:
+            for port in ['7275', '8080']:
+                with (
+                    self.subTest(engine=engine, port=port),
+                    tempfile.TemporaryDirectory() as data_dir,
+                    patch.object(vulnscout, 'VULNSCOUT_ENV_FLASK_RUN_PORT', port),
+                    patch.object(self.command, '_is_container_running', return_value=False),
+                    patch.object(self.command, '_is_container_present', return_value=False),
+                    patch.object(self.command, '_wait_for_container_ready') as ready,
+                    patch.object(vulnscout.subprocess, 'run') as run,
+                ):
+                    args = self.parse('--container-name', 'web-settings')
+                    self.command._ensure_container_running(engine, args.container_name, args, data_dir)
+                    run.assert_called_once_with([
+                        engine, 'run', '-d', '--name', 'web-settings',
+                        '-p', f'{port}:{port}',
+                        '-e', 'FLASK_RUN_HOST=0.0.0.0', '-e', f'FLASK_RUN_PORT={port}',
+                        '-v', f'{data_dir}:/cache/vulnscout',
+                        vulnscout.DEFAULT_VULNSCOUT_IMAGE, 'daemon',
+                    ], check=True)
+                    ready.assert_called_once_with(engine, 'web-settings')
+
+    def test_serve_forwards_native_web_settings(self):
+        for host in ['0.0.0.0', '::', '127.0.0.1']:
+            with (
+                self.subTest(host=host),
+                patch.object(vulnscout, 'VULNSCOUT_ENV_FLASK_RUN_HOST', host),
+                patch.object(vulnscout, 'VULNSCOUT_ENV_FLASK_RUN_PORT', '8080'),
+                patch.object(self.command, '_resolve_container_engine', return_value='podman'),
+                patch.object(self.command, '_ensure_container_running'),
+                patch.object(vulnscout.subprocess, 'run') as run,
+            ):
+                args = self.parse('--serve', '--refresh-vulnerability-data')
+                self.command._run_vulnscout(args, [], '/cache')
+                self.assertEqual(run.call_args.args[0], [
+                    'podman', 'exec', '-e', f'FLASK_RUN_HOST={host}', '-e', 'FLASK_RUN_PORT=8080',
+                    'vulnscout', '/scan/src/entrypoint.sh',
+                    '--project', 'default', '--variant', 'default',
+                    '--refresh-vulnerability-data', '--serve',
+                ])
+
+    def test_invalid_native_web_settings_are_rejected(self):
+        cases = [
+            ('VULNSCOUT_ENV_FLASK_RUN_PORT', port)
+            for port in ['', '0', '-1', '65536', '8080/tcp', '1.5']
+        ] + [('VULNSCOUT_ENV_FLASK_RUN_HOST', ''), ('VULNSCOUT_ENV_FLASK_RUN_HOST', '   ')]
+        for name, value in cases:
+            with (
+                self.subTest(name=name, value=value),
+                patch.object(vulnscout, name, value),
+                patch.object(self.command, 'die', side_effect=fail),
+            ):
+                with self.assertRaisesRegex(RuntimeError, 'FLASK_RUN_'):
+                    self.command._web_server_settings()
+
+    def test_web_environment_defaults_aliases_and_precedence(self):
+        cases = [
+            ({}, ('0.0.0.0', '7275')),
+            ({'FLASK_RUN_HOST': '::', 'FLASK_RUN_PORT': '8080'}, ('::', '8080')),
+            ({
+                'VULNSCOUT_ENV_FLASK_RUN_HOST': '0.0.0.0',
+                'VULNSCOUT_ENV_FLASK_RUN_PORT': '9090',
+            }, ('0.0.0.0', '9090')),
+            ({
+                'VULNSCOUT_ENV_FLASK_RUN_HOST': '0.0.0.0',
+                'VULNSCOUT_ENV_FLASK_RUN_PORT': '9090',
+                'FLASK_RUN_HOST': '127.0.0.1', 'FLASK_RUN_PORT': '8080',
+            }, ('0.0.0.0', '9090')),
+        ]
+        for settings, expected in cases:
+            with self.subTest(settings=settings), patch.dict(vulnscout.os.environ, settings):
+                module = importlib.util.module_from_spec(SPEC)
+                SPEC.loader.exec_module(module)
+                self.assertEqual(module.ZephyrVulnScout()._web_server_settings(), expected)
 
     def test_refresh_only_skips_generation_and_import(self):
         for wrapper in [False, True]:

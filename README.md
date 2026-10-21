@@ -77,6 +77,14 @@ scan, except for the refresh-only mode described below.
 Full scans may require network access and scanner credentials.
 Do not start a second web server if one is already running in the container.
 
+Direct mode accepts `VULNSCOUT_ENV_FLASK_RUN_HOST` and
+`VULNSCOUT_ENV_FLASK_RUN_PORT`, matching `meta-vulnscout`, with native
+`FLASK_RUN_HOST`/`FLASK_RUN_PORT` fallbacks. New containers publish the selected
+port on the same host port; existing containers retain their original mappings.
+See
+[Custom port and browser URL](doc/usage/interactive-mode.md#custom-port-and-browser-url)
+for an example and hostname/TLS considerations.
+
 In direct mode, VulnScout data is persisted on the host by mounting
 `<build-dir>/../.vulnscout/cache` to `/cache/vulnscout` in the container. For
 example with `-d demo/mbedtls_sbom/build`, the database is stored at

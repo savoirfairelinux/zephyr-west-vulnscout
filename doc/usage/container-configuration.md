@@ -8,7 +8,10 @@ needed.
 
 Use `--container-engine {auto,docker,podman}` to select the engine. Auto mode
 prefers Podman, then Docker. `--container-name NAME` changes the default
-container name, `vulnscout`. Newly created containers publish port 7275.
+container name, `vulnscout`. Newly created containers publish the native
+`VULNSCOUT_ENV_FLASK_RUN_PORT` on the same host port (7275 by default). See
+{ref}`custom-port-and-browser-url`
+for configuration and existing-container limitations.
 
 ## Persistent cache
 
