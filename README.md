@@ -45,6 +45,11 @@ west update zephyr-west-vulnscout
 west help vulnscout
 ```
 
+The help groups options by feature and includes examples for imports, scanning,
+refresh, reports, exports, policy checks, and container lifecycle. With no
+action, the command generates and imports an SBOM; scanning requires
+`--perform-scan`. The `report` and `export` actions use stored data instead.
+
 ## Example usage
 
 From your Zephyr workspace root:
@@ -85,7 +90,7 @@ Direct mode accepts `VULNSCOUT_ENV_FLASK_RUN_HOST` and
 `FLASK_RUN_HOST`/`FLASK_RUN_PORT` fallbacks. New containers publish the selected
 port on the same host port; existing containers retain their original mappings.
 See
-[Custom port and browser URL](doc/usage/interactive-mode.md#custom-port-and-browser-url)
+[Custom port and browser URL](doc/interactive-mode.md#custom-port-and-browser-url)
 for an example and hostname/TLS considerations.
 
 In direct mode, VulnScout data is persisted on the host by mounting
@@ -140,7 +145,7 @@ Exit codes distinguish no match (`0`), execution errors (`1`), and a policy
 match (`2`). Add `--perform-scan` to request all scanners before evaluation.
 Conditions use stored metadata unless it is explicitly refreshed, and cannot
 be combined with `--serve`.
-See [Monitor Vulnerabilities](doc/usage/monitor-vulnerabilities.md) for tokens,
+See [Monitor Vulnerabilities](doc/monitor-vulnerabilities.md) for tokens,
 examples, scope, refresh behavior, and CI integration.
 
 ### Generate a report
@@ -215,7 +220,7 @@ running scanners. Keep the same project, variant, and cache as the original
 import; pass `--vulnscout-data-dir /path/to/existing/cache` when needed.
 Missing or ambiguous scope selections are rejected. This action requires
 direct container mode, not `--vulnscout-cmd`.
-See [Exporting SBOM Files](doc/usage/exports.md) for filenames and examples.
+See [Exporting SBOM Files](doc/exports.md) for filenames and examples.
 
 ### Container lifecycle
 

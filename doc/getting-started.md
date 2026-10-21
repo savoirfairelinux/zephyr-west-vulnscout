@@ -22,5 +22,5 @@ west update zephyr-west-vulnscout
 west help vulnscout
 ```
 
-Continue with [SBOM Generation and Import](usage/sbom-generation.md) to generate
+Continue with [SBOM Generation and Import](sbom-generation.md) to generate
 your first SBOM and select its project and variant.

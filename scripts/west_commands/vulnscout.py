@@ -42,17 +42,16 @@ SBOM_EXPORT_FILES = {
 
 
 VULNSCOUT_DESCRIPTION = """\
-Generate SPDX SBOM files using west spdx, then import them into VulnScout.
+Generate/import a Zephyr SBOM or work with stored VulnScout results.
 
-By default this command runs `west spdx --spdx-version 3.0`, then imports all
-`*.jsonld` files from the SPDX output directory into VulnScout using
-`--add-spdx` via `docker exec` or `podman exec`. In direct mode it mounts
-`<build-dir>/../.vulnscout/cache` to `/cache/vulnscout` for persistent database
-storage.
+With no action, generate SPDX 3.0 using west spdx and import it into VulnScout.
+This does not request vulnerability scanners; add --perform-scan to run them.
+Build the application with CONFIG_BUILD_OUTPUT_META=y first.
 
-Use `west vulnscout report` to generate a report from the existing database
-and `west vulnscout export` to export stored data as an SBOM or OpenVEX.
-Both copy their output to the host without importing or scanning again."""
+Actions:
+  report   Generate a report from stored data; no import or scan.
+  export   Export stored data as SPDX, CycloneDX, or OpenVEX; no import or scan.
+  stop     Stop and remove the container; no build directory required."""
 
 
 class ZephyrVulnScout(WestCommand):
@@ -62,110 +61,134 @@ class ZephyrVulnScout(WestCommand):
     def do_add_parser(self, parser_adder):
         parser = parser_adder.add_parser(
             self.name,
+            usage=(
+                '%(prog)s -d BUILD_DIR [options]\n'
+                '       %(prog)s {report,export} -d BUILD_DIR [options]\n'
+                '       %(prog)s stop [container options]'
+            ),
             description=self.description,
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog=textwrap.dedent(
-                """\
+                r"""
             Examples:
-
-                # Build first (with CONFIG_BUILD_OUTPUT_META=y), then:
+              Generate and import an SBOM:
                 west vulnscout -d build
 
-                                # Direct container exec mode:
-                                west vulnscout -d build --serve
+              Import, run all scanners, and start the web interface:
+                west vulnscout -d build --perform-scan --serve
 
-                                # Wrapper mode with custom VulnScout image and dev mode:
-                                west vulnscout -d build --vulnscout-cmd vulnscout \
-                                    --vulnscout-image sfl:custom --serve --dev
-
-                # Skip SPDX generation and import an existing SPDX output directory:
+              Import existing SPDX files without regenerating them:
                 west vulnscout -d build --no-generate --spdx-dir build/spdx
 
-                # Stop the VulnScout container and exit:
-                west vulnscout stop
+              Refresh stored vulnerability metadata without a new SBOM:
+                west vulnscout -d build --refresh-vulnerability-data
 
-                # Generate a report from the existing database:
+              Generate an HTML report from stored data:
                 west vulnscout report -d build --format html
 
-                # Export stored data as SPDX 2.3:
+              Export stored data as SPDX 2.3:
                 west vulnscout export -d build --format spdx2
 
-                # Exit with code 2 if a critical vulnerability is found:
-                west vulnscout -d build --match-condition "cvss >= 9.0"
+              Run scanners and exit with code 2 if a critical issue is found:
+                west vulnscout -d build --perform-scan \
+                  --match-condition 'cvss >= 9.0 and (pending or affected)'
 
-                # Request SPDX 3.1 explicitly (requires spdx-python-model v3_1):
-                west vulnscout -d build --spdx-version 3.1
+              Use a custom image through the wrapper in development mode:
+                west vulnscout -d build --vulnscout-cmd vulnscout \
+                  --vulnscout-image sfl:custom --serve --dev
+
+              Stop and remove the container:
+                west vulnscout stop
+
+            Notes:
+              Reuse the same --project, --variant, and cache across commands.
+              Report/export actions require direct Docker/Podman mode.
+              --serve cannot be combined with --match-condition or --stop-after-run.
+              Policy exit codes: 0 = no match, 2 = match, 1 = error.
+              Direct-mode web settings: VULNSCOUT_ENV_FLASK_RUN_HOST (0.0.0.0)
+              and VULNSCOUT_ENV_FLASK_RUN_PORT (7275), with native Flask fallbacks.
             """
-            ),
+            ).strip(),
         )
+
+        scope = parser.add_argument_group('Build, project, and cache')
+        sbom = parser.add_argument_group('SBOM generation and import')
+        scanning = parser.add_argument_group('Vulnerability scanning and monitoring')
+        web = parser.add_argument_group('Web interface')
+        outputs = parser.add_argument_group('Reports and exports')
+        container = parser.add_argument_group('Container and wrapper configuration')
+        lifecycle = parser.add_argument_group('Container lifecycle')
 
         parser.add_argument(
             'action',
             nargs='?',
             choices=['stop', 'report', 'export'],
-            help='stop the container, generate a report, or export stored data',
+            help='optional action; omit to generate/import an SBOM',
         )
-        parser.add_argument('-d', '--build-dir', help='Zephyr build directory')
-        parser.add_argument(
+        scope.add_argument(
+            '-d', '--build-dir',
+            help='Zephyr build directory (required except for stop)',
+        )
+        sbom.add_argument(
             '--spdx-dir',
             help='SPDX output directory (default: <build-dir>/spdx)',
         )
-        parser.add_argument(
+        sbom.add_argument(
             '--spdx-version',
             choices=['3.0', '3.1'],
             default='3.0',
-            help='SPDX specification version passed to west spdx (default: 3.0)',
+            help='generation version (default: 3.0; 3.1 needs spdx-python-model v3_1 bindings)',
         )
-        parser.add_argument(
+        sbom.add_argument(
             '--namespace-prefix',
             help='namespace prefix passed to west spdx',
         )
-        parser.add_argument(
+        sbom.add_argument(
             '--include-sdk',
             action='store_true',
             help='also generate SPDX document for SDK',
         )
-        parser.add_argument(
+        sbom.add_argument(
             '--analyze-includes',
             action='store_true',
             help='also analyze included header files',
         )
-        parser.add_argument(
+        sbom.add_argument(
             '--no-generate',
             action='store_true',
-            help='skip west spdx generation and reuse files from --spdx-dir',
+            help='skip generation but still import existing SPDX files',
         )
-        parser.add_argument(
+        lifecycle.add_argument(
             '--stop',
             action='store_true',
-            help='stop VulnScout container and exit',
+            help='alias for the stop action: stop/remove the container and exit',
         )
-        parser.add_argument(
+        lifecycle.add_argument(
             '--stop-after-run',
             action='store_true',
-            help='stop VulnScout container after a successful run',
+            help='stop/remove after completion, including a policy match (exit 2)',
         )
-        parser.add_argument(
+        sbom.add_argument(
             '--spdx-file',
             action='append',
             default=[],
             help='specific SPDX file to import (can be used multiple times)',
         )
-        parser.add_argument(
+        scope.add_argument(
             '--project',
             default='default',
             help='VulnScout project name (default: default)',
         )
-        parser.add_argument(
+        scope.add_argument(
             '--variant',
             default='default',
-            help='VulnScout variant name (default: default)',
+            help='variant within the project (default: default, not all variants)',
         )
-        parser.add_argument(
+        container.add_argument(
             '--vulnscout-cmd',
-            help='optional VulnScout wrapper command or absolute path',
+            help='use a wrapper instead of direct container mode (not for report/export)',
         )
-        parser.add_argument(
+        container.add_argument(
             '--vulnscout-image',
             help=(
                 'container image repository or repository:tag override '
@@ -173,66 +196,70 @@ class ZephyrVulnScout(WestCommand):
                 f'(default: {DEFAULT_VULNSCOUT_IMAGE})'
             ),
         )
-        parser.add_argument(
+        container.add_argument(
             '--container-engine',
             choices=['auto', 'docker', 'podman'],
             default='auto',
             help='container engine for direct exec mode (default: auto)',
         )
-        parser.add_argument(
+        container.add_argument(
             '--container-name',
             default='vulnscout',
             help='VulnScout container name for direct exec mode (default: vulnscout)',
         )
-        parser.add_argument(
+        scope.add_argument(
             '--vulnscout-data-dir',
             help=(
                 'host directory mounted to /cache/vulnscout in direct mode '
                 '(default: <build-dir>/../.vulnscout/cache)'
             ),
         )
-        parser.add_argument(
+        scanning.add_argument(
             '--perform-scan',
             action='store_true',
             help='run all VulnScout scanners after import (passes --perform-scans all)',
         )
-        parser.add_argument(
+        web.add_argument(
             '--serve',
             action='store_true',
-            help='pass --serve to VulnScout',
+            help='start the web interface after processing (default: http://localhost:7275/)',
         )
-        parser.add_argument(
+        web.add_argument(
             '--dev',
             action='store_true',
             help='pass --dev to VulnScout (wrapper mode only)',
         )
-        parser.add_argument(
+        scanning.add_argument(
             '--refresh-vulnerability-data',
             action='store_true',
             help=(
-                'refresh stored vulnerability data without importing SBOMs '
-                '(unless --perform-scan is also set)'
+                'refresh metadata; skip West SBOM generation unless '
+                '--perform-scan is also set'
             ),
         )
-        parser.add_argument(
+        scanning.add_argument(
             '--match-condition',
-            help='evaluate a vulnerability condition (exit 2 if matched, 0 if not, 1 on error)',
+            metavar='EXPRESSION',
+            help='evaluate a quoted policy expression after processing (see exit codes below)',
         )
-        parser.add_argument(
+        outputs.add_argument(
             '--template',
-            help='report template name already installed in VulnScout (default: summary.adoc)',
+            help='report only: installed template filename (default: summary.adoc)',
         )
-        parser.add_argument(
+        outputs.add_argument(
             '--format',
             choices=['html', 'pdf', *SBOM_EXPORT_FILES],
             help=(
-                'report conversion (html/pdf) or export format '
-                '(default: native template format for report, spdx3 for export)'
+                'report: html/pdf (default: template format); '
+                'export: SBOM/OpenVEX format (default: spdx3)'
             ),
         )
-        parser.add_argument(
+        outputs.add_argument(
             '--output-dir',
-            help='host output directory (default: <build-dir>/vulnscout-reports or vulnscout-exports)',
+            help=(
+                'host output directory (report default: BUILD_DIR/vulnscout-reports; '
+                'export default: BUILD_DIR/vulnscout-exports)'
+            ),
         )
 
         return parser

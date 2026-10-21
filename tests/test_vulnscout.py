@@ -7,6 +7,7 @@ import contextlib
 import importlib.util
 import io
 import pathlib
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -51,6 +52,73 @@ class VulnScoutCommandTests(unittest.TestCase):
 
     def parse(self, *arguments):
         return self.parser.parse_args(['vulnscout', *arguments])
+
+    def test_help_has_a_short_synopsis_and_feature_groups(self):
+        with patch.dict(vulnscout.os.environ, {'COLUMNS': '80'}):
+            root = argparse.ArgumentParser(prog='west')
+            parser = self.command.do_add_parser(root.add_subparsers())
+            help_text = parser.format_help()
+        synopsis = help_text.split('\n\n', 1)[0]
+        self.assertEqual(synopsis.splitlines(), [
+            'usage: west vulnscout -d BUILD_DIR [options]',
+            '       west vulnscout {report,export} -d BUILD_DIR [options]',
+            '       west vulnscout stop [container options]',
+        ])
+        groups = [
+            ('Build, project, and cache', '--project'),
+            ('SBOM generation and import', '--no-generate'),
+            ('Vulnerability scanning and monitoring', '--match-condition'),
+            ('Web interface', '--serve'),
+            ('Reports and exports', '--template'),
+            ('Container and wrapper configuration', '--vulnscout-cmd'),
+            ('Container lifecycle', '--stop-after-run'),
+        ]
+        for index, (title, option) in enumerate(groups):
+            with self.subTest(group=title):
+                section = help_text.split(f'{title}:\n', 1)[1]
+                next_title = groups[index + 1][0] if index + 1 < len(groups) else 'Examples'
+                section = section.split(f'\n{next_title}:\n', 1)[0]
+                self.assertIn(option, section)
+        self.assertIn('does not request vulnerability scanners', help_text)
+        self.assertIn('Policy exit codes: 0 = no match, 2 = match, 1 = error.', help_text)
+        for line in help_text.splitlines():
+            self.assertLessEqual(len(line), 80, line)
+
+    def test_help_examples_are_aligned_and_parseable(self):
+        parser = self.command.do_add_parser(argparse.ArgumentParser(prog='west').add_subparsers())
+        help_text = parser.format_help()
+        examples = help_text.split('Examples:\n', 1)[1].split('\nNotes:\n', 1)[0]
+        self.assertIn(
+            '    west vulnscout -d build --vulnscout-cmd vulnscout \\\n'
+            '      --vulnscout-image sfl:custom --serve --dev',
+            examples,
+        )
+        commands = []
+        pending = ''
+        for line in examples.splitlines():
+            if not line.strip() or not (pending or line.strip().startswith('west vulnscout ')):
+                continue
+            self.assertTrue(line.startswith('      ' if pending else '    west '), line)
+            pending += line.strip()
+            if pending.endswith('\\'):
+                pending = pending[:-1] + ' '
+            else:
+                commands.append(self.parse(*shlex.split(pending)[2:]))
+                pending = ''
+        self.assertFalse(pending)
+        self.assertEqual(len(commands), 9)
+        self.assertEqual([args.action for args in commands],
+                         [None, None, None, None, 'report', 'export', None, None, 'stop'])
+        self.assertTrue(commands[1].perform_scan)
+        self.assertTrue(commands[1].serve)
+        self.assertTrue(commands[2].no_generate)
+        self.assertTrue(commands[3].refresh_vulnerability_data)
+        self.assertEqual(commands[4].format, 'html')
+        self.assertEqual(commands[5].format, 'spdx2')
+        self.assertEqual(commands[6].match_condition, 'cvss >= 9.0 and (pending or affected)')
+        self.assertEqual(commands[7].vulnscout_image, 'sfl:custom')
+        self.assertTrue(commands[7].dev)
+        self.assertIsNone(commands[8].build_dir)
 
     def test_stop_forms_skip_build_and_import(self):
         for arguments in [('stop',), ('--stop',), ('stop', '--stop')]:
