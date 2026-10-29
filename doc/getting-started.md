@@ -9,7 +9,7 @@ west-commands.yml:
 manifest:
   projects:
     - name: zephyr-west-vulnscout
-      url: https://github.com/ValentinBoudevinSFL/zephyr-west-vulnscout
+      url: https://github.com/savoirfairelinux/zephyr-west-vulnscout
       revision: main
       path: zephyr-west-vulnscout
       west-commands: west-commands.yml

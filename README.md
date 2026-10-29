@@ -52,7 +52,6 @@ west help vulnscout
 
 Commands follow VulnScout v0.24's command-first syntax. `add` generates and
 imports an SBOM. The other data commands use stored results.
-Legacy workflow flags remain accepted with a deprecation warning.
 See [Migrating existing commands](doc/sbom-generation.md#migrating-existing-commands).
 
 ## Example usage
@@ -84,10 +83,8 @@ ZEPHYR_BASE="$PWD/zephyr" west vulnscout add \
   --no-generate
 ```
 
-In direct mode, VulnScout data is persisted on the host by mounting
-`<build-dir>/../.vulnscout/cache` to `/cache/vulnscout` in the container. For
-example with `-d demo/mbedtls_sbom/build`, the database is stored at
-`demo/mbedtls_sbom/.vulnscout/cache/vulnscout.db`.
+In direct mode, VulnScout data persists on the host in
+`<build-dir>/../.vulnscout/cache`.
 
 See [Container Lifecycle and Configuration](doc/container-configuration.md)
 for cache selection, concurrent operations, and image compatibility.
@@ -138,11 +135,7 @@ Assessment happens in VulnScout, not through a separate West assessment command.
 The diagram's optional AI assistance belongs to VulnScout and requires separate
 configuration. It is not enabled by `serve`.
 
-Direct mode accepts `VULNSCOUT_ENV_FLASK_RUN_HOST` and
-`VULNSCOUT_ENV_FLASK_RUN_PORT`, with native `FLASK_RUN_HOST`/`FLASK_RUN_PORT`
-fallbacks. New containers publish the selected port on the same host port.
-Existing containers retain their original mappings.
-See [Custom port and browser URL](doc/interactive-mode.md#custom-port-and-browser-url).
+See [Interactive Mode](doc/interactive-mode.md) for custom ports and web settings.
 
 ### 04 - Enforce
 
@@ -194,18 +187,7 @@ Both report and export require direct container mode rather than a wrapper.
 See [Exporting SBOM Files](doc/exports.md) for supported formats, filenames,
 scope selection, and errors.
 
-## Container lifecycle and wrapper mode
-
-To stop the VulnScout container cleanly after task completion:
-
-```sh
-ZEPHYR_BASE="$PWD/zephyr" west vulnscout add \
-  -d demo/mbedtls_sbom/build \
-  --no-generate \
-  --project zephyr_demo \
-  --variant mbedtls_native_sim \
-  --stop-after-run
-```
+## Container lifecycle and configuration
 
 To stop the container immediately:
 
@@ -213,27 +195,10 @@ To stop the container immediately:
 west vulnscout stop
 ```
 
-The legacy `west vulnscout --stop` syntax remains supported with a warning.
-Both forms accept `--container-engine`, `--container-name`, and `--vulnscout-cmd`.
-Neither requires a build directory. Stopping removes the container, but
-preserves its host-mounted data.
-
-If you prefer using the VulnScout wrapper script instead of direct container
-exec mode:
-
-```sh
-west vulnscout serve \
-  -d demo/mbedtls_sbom/build \
-  --vulnscout-cmd /path/to/vulnscout \
-  --vulnscout-image sfl:custom \
-  --dev
-```
-
-`--vulnscout-image` is interpreted as `repo[:tag]`. If the tag is omitted,
-the command uses `VULNSCOUT_VERSION` (or `VULNSCOT_VERSION`), defaulting to
-`v0.24`. The default image is `docker.io/sflinux/vulnscout:v0.24`.
-
-Use `--vulnscout-data-dir /path/to/data` to override the default data location.
+Stopping removes the container while preserving its host-mounted data.
+The default image is `docker.io/sflinux/vulnscout:v0.24`.
+See [Container Lifecycle and Configuration](doc/container-configuration.md)
+for image and cache selection, automatic cleanup, and wrapper mode.
 
 ## Repository layout
 
