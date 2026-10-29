@@ -23,11 +23,17 @@ from vulnscout_helpers.process import DEFAULT_OPERATION_TIMEOUT, MANAGEMENT_TIME
 VULNSCOUT_DESCRIPTION = """\
 Generate/import a Zephyr SBOM or work with stored VulnScout results.
 
-With no action, generate SPDX 3.0 using west spdx and import it into VulnScout.
-This does not request vulnerability scanners; add --perform-scan to run them.
+Use add to generate SPDX 3.0 using west spdx and import it into VulnScout.
+This does not request vulnerability scanners. Use scan to run them afterward.
 Build the application with CONFIG_BUILD_OUTPUT_META=y first.
 
-Actions:
+Commands:
+  add      Generate/import an SBOM (the default for legacy invocations).
+  scan     Scan stored data with all or selected scanners. No import.
+  refresh  Refresh stored vulnerability metadata. No import or scan.
+  match-condition EXPRESSION
+           Test stored vulnerabilities (exit 2 for a match, 0 otherwise).
+  serve    Start the web interface without importing or refreshing.
   report   Generate a report from stored data; no import or scan.
   export   Export stored data as SPDX, CycloneDX, or OpenVEX; no import or scan.
   stop     Stop and remove the container; no build directory required."""
@@ -41,8 +47,7 @@ class ZephyrVulnScout(WestCommand):
         parser = parser_adder.add_parser(
             self.name,
             usage=(
-                '%(prog)s -d BUILD_DIR [options]\n'
-                '       %(prog)s {report,export} -d BUILD_DIR [options]\n'
+                '%(prog)s COMMAND [arguments] -d BUILD_DIR [options]\n'
                 '       %(prog)s stop [container options]'
             ),
             description=self.description,
@@ -51,30 +56,33 @@ class ZephyrVulnScout(WestCommand):
                 r"""
             Examples:
               Generate and import an SBOM:
-                west vulnscout -d build
+                west vulnscout add -d build
 
-              Import, run all scanners, and start the web interface:
-                west vulnscout -d build --perform-scan --serve
+              Run all scanners against stored data:
+                west vulnscout scan -d build
+
+              Run only OSV and sbom-cve-check:
+                west vulnscout scan osv sbom-cve-check -d build
 
               Import existing SPDX files without regenerating them:
-                west vulnscout -d build --no-generate --spdx-dir build/spdx
+                west vulnscout add -d build --no-generate --spdx-dir build/spdx
 
               Refresh stored vulnerability metadata without a new SBOM:
-                west vulnscout -d build --refresh-vulnerability-data
+                west vulnscout refresh -d build
 
               Generate an HTML report from stored data:
-                west vulnscout report -d build --format html
+                west vulnscout report summary.adoc -d build --format html
 
               Export stored data as SPDX 2.3:
-                west vulnscout export -d build --format spdx2
+                west vulnscout export spdx -d build --format spdx2
 
-              Run scanners and exit with code 2 if a critical issue is found:
-                west vulnscout -d build --perform-scan \
-                  --match-condition 'cvss >= 9.0 and (pending or affected)'
+              Exit with code 2 if a critical issue is found in stored data:
+                west vulnscout match-condition \
+                  'cvss >= 9.0 and (pending or affected)' -d build
 
               Use a custom image through the wrapper in development mode:
-                west vulnscout -d build --vulnscout-cmd vulnscout \
-                  --vulnscout-image sfl:custom --serve --dev
+                west vulnscout serve -d build --vulnscout-cmd vulnscout \
+                  --vulnscout-image sfl:custom --dev
 
               Stop and remove the container:
                 west vulnscout stop
@@ -82,7 +90,8 @@ class ZephyrVulnScout(WestCommand):
             Notes:
               Reuse the same --project, --variant, and cache across commands.
               Report/export actions require direct Docker/Podman mode.
-              --serve cannot be combined with --match-condition or --stop-after-run.
+              serve cannot be combined with --stop-after-run.
+              Legacy workflow flags remain accepted with a deprecation warning.
               Policy exit codes: 0 = no match, 2 = match, 1 = error.
               Direct-mode web settings: VULNSCOUT_ENV_FLASK_RUN_HOST (0.0.0.0)
               and VULNSCOUT_ENV_FLASK_RUN_PORT (7275), with native Flask fallbacks.
@@ -101,12 +110,16 @@ class ZephyrVulnScout(WestCommand):
         parser.add_argument(
             'action',
             nargs='?',
-            choices=['stop', 'report', 'export'],
-            help='optional action; omit to generate/import an SBOM',
+            choices=['add', 'scan', 'refresh', 'match-condition', 'serve', 'stop', 'report', 'export'],
+            help='command (omit only for legacy generate/import workflows)',
+        )
+        parser.add_argument(
+            'parameters', nargs='*', metavar='ARG',
+            help='scanner types, a condition expression, a report template, or an export kind',
         )
         scope.add_argument(
             '-d', '--build-dir',
-            help='Zephyr build directory (required except for stop)',
+            help='Zephyr build directory or cache anchor (required except for stop)',
         )
         sbom.add_argument(
             '--spdx-dir',
@@ -140,7 +153,7 @@ class ZephyrVulnScout(WestCommand):
         lifecycle.add_argument(
             '--stop',
             action='store_true',
-            help='alias for the stop action: stop/remove the container and exit',
+            help='deprecated alias for stop: stop/remove the container and exit',
         )
         lifecycle.add_argument(
             '--stop-after-run',
@@ -148,18 +161,18 @@ class ZephyrVulnScout(WestCommand):
             help='stop/remove after completion, including a policy match (exit 2)',
         )
         sbom.add_argument(
-            '--spdx-file',
+            '--spdx', '--spdx-file', dest='spdx_file',
             action='append',
             default=[],
-            help='specific SPDX file to import (can be used multiple times)',
+            help='add: import an existing SPDX file without generation (repeatable)',
         )
         scope.add_argument(
-            '--project',
+            '-p', '--project',
             default='default',
             help='VulnScout project name (default: default)',
         )
         scope.add_argument(
-            '--variant',
+            '-v', '--variant',
             default='default',
             help='variant within the project (default: default, not all variants)',
         )
@@ -201,12 +214,12 @@ class ZephyrVulnScout(WestCommand):
         scanning.add_argument(
             '--perform-scan',
             action='store_true',
-            help='run all VulnScout scanners after import (passes --perform-scans all)',
+            help='deprecated: import and scan. Use add followed by scan instead',
         )
         web.add_argument(
             '--serve',
             action='store_true',
-            help='start the web interface after processing (default: http://localhost:7275/)',
+            help='deprecated: serve after processing. Use the serve command instead',
         )
         web.add_argument(
             '--dev',
@@ -216,16 +229,19 @@ class ZephyrVulnScout(WestCommand):
         scanning.add_argument(
             '--refresh-vulnerability-data',
             action='store_true',
-            help=(
-                'refresh metadata; skip West SBOM generation unless '
-                '--perform-scan is also set'
-            ),
+            help='deprecated: refresh metadata. Use the refresh command instead',
         )
         scanning.add_argument(
             '--match-condition',
             metavar='EXPRESSION',
-            help='evaluate a quoted policy expression after processing (see exit codes below)',
+            help='deprecated: evaluate after processing. Use match-condition EXPRESSION instead',
         )
+        for scanner in (*options.SCANNERS, 'all'):
+            scanning.add_argument(
+                f'--{scanner}', dest='scanners', action='append_const', const=scanner,
+                help=f'scan: select {scanner}',
+            )
+        parser.set_defaults(scanners=[])
         outputs.add_argument(
             '--template',
             help='report only: installed template filename (default: summary.adoc)',
@@ -257,6 +273,15 @@ class ZephyrVulnScout(WestCommand):
     def _run_workflow(self, args: argparse.Namespace, unknown_args: list[str]) -> None:
         if unknown_args:
             self.die(f'Unexpected arguments: {unknown_args}')
+        if args.action is None or any((
+            args.stop, args.perform_scan, args.refresh_vulnerability_data,
+            args.serve, args.match_condition is not None,
+        )):
+            self.wrn(
+                'Legacy workflow syntax is deprecated. Use add, scan, refresh, '
+                'match-condition, serve, report, export, or stop.'
+            )
+        options.normalize_command(args)
         options.validate_options(args)
         output = options.stored_output_spec(args) if args.action in ('report', 'export') else None
         if args.action == 'stop' or args.stop:
@@ -281,10 +306,11 @@ class ZephyrVulnScout(WestCommand):
                 self._stop_vulnscout_container(args)
             return
 
+        stored_only = args.action in ('scan', 'refresh', 'match-condition', 'serve')
         refresh_only = args.refresh_vulnerability_data and not args.perform_scan
         spdx_files = []
-        if not refresh_only:
-            if not args.no_generate:
+        if not stored_only and not refresh_only:
+            if not args.no_generate and not args.spdx_file:
                 self._run_west_spdx(args, build_dir, spdx_dir)
 
             spdx_files = self._resolve_spdx_files(args.spdx_file, spdx_dir)
@@ -364,7 +390,7 @@ class ZephyrVulnScout(WestCommand):
 
     def _stop_vulnscout_container(self, args: argparse.Namespace, best_effort: bool = False) -> None:
         if args.vulnscout_cmd:
-            stop_cmd = [args.vulnscout_cmd, '--stop']
+            stop_cmd = [args.vulnscout_cmd, 'stop']
             self.inf(f'Stopping VulnScout container with wrapper: {quote_sh_list(stop_cmd)}')
             env = os.environ.copy()
             env.update(options.image_environment(args))
@@ -437,19 +463,21 @@ class ZephyrVulnScout(WestCommand):
     ) -> int:
         accepted_codes = (0, 2) if args.match_condition else (0,)
         if args.vulnscout_cmd:
-            command = [args.vulnscout_cmd, *options.processing_arguments(args, spdx_files)]
-            if args.serve:
-                command.append('--serve')
-            if args.dev:
-                command.append('--dev')
             env = os.environ.copy()
             env.update(options.image_environment(args))
-            self.inf(f'Running VulnScout command: {quote_sh_list(command)}')
-            result = run_command(
-                command, 'VulnScout', env=env, accepted_codes=accepted_codes,
-                timeout=None if args.serve else args.timeout,
-            )
-            return 2 if result.returncode == 2 else 0
+            exit_code = 0
+            for arguments in options.wrapper_commands(args, spdx_files):
+                command = [args.vulnscout_cmd, *arguments]
+                if args.dev:
+                    command.append('--dev')
+                self.inf(f'Running VulnScout command: {quote_sh_list(command)}')
+                result = run_command(
+                    command, 'VulnScout', env=env,
+                    accepted_codes=(0, 2) if arguments[0] == 'match-condition' else (0,),
+                    timeout=None if arguments[0] == 'serve' else args.timeout,
+                )
+                exit_code = result.returncode
+            return 2 if exit_code == 2 else 0
 
         instance = self._container(args)
         instance.ensure_running(data_dir, options.resolve_image(args), *options.configured_web_settings())
@@ -461,9 +489,11 @@ class ZephyrVulnScout(WestCommand):
         with instance.input_workspace() as directory:
             staged = instance.stage_files(spdx_files, directory) if spdx_files else []
             self.inf(f'Processing VulnScout project "{args.project}", variant "{args.variant}"')
-            exit_code = instance.run_processing(
-                options.processing_arguments(args, staged), directory, accepted_codes=accepted_codes,
-            )
+            exit_code = 0
+            if args.action != 'serve':
+                exit_code = instance.run_processing(
+                    options.processing_arguments(args, staged), directory, accepted_codes=accepted_codes,
+                )
         if args.serve:
             host, port = options.configured_web_settings()
             serve_command = container.container_exec(

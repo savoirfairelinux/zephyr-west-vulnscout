@@ -6,11 +6,11 @@ Build the application with `CONFIG_BUILD_OUTPUT_META=y` first, then run from
 your Zephyr workspace root:
 
 ```sh
-ZEPHYR_BASE="$PWD/zephyr" west vulnscout \
+ZEPHYR_BASE="$PWD/zephyr" west vulnscout add \
   -d demo/mbedtls_sbom/build
 ```
 
-By default, the command generates SPDX 3.0 SBOMs using `west spdx` and imports
+By default, `add` generates SPDX 3.0 SBOMs using `west spdx` and imports
 the matching files from `<build-dir>/spdx`:
 
 - `*.jsonld`
@@ -30,7 +30,7 @@ application's SBOM under a named project and variant, use the same command
 with explicit names:
 
 ```sh
-ZEPHYR_BASE="$PWD/zephyr" west vulnscout \
+ZEPHYR_BASE="$PWD/zephyr" west vulnscout add \
   -d demo/mbedtls_sbom/build \
   --project zephyr_demo --variant mbedtls_native_sim
 ```
@@ -48,15 +48,15 @@ an existing container, check its cache location as described in
 Skip generation and import files already present in the SPDX directory:
 
 ```sh
-west vulnscout -d demo/mbedtls_sbom/build \
+west vulnscout add -d demo/mbedtls_sbom/build \
   --no-generate --spdx-dir demo/mbedtls_sbom/build/spdx \
   --project zephyr_demo --variant mbedtls_native_sim
 ```
 
-Use `--spdx-file /path/to/file.jsonld` to select an explicit file. Repeat the
-option for companion documents; when explicit files are supplied, directory
-discovery is skipped. Import all West companion documents together to retain
-their cross-document relationships.
+Use `--spdx /path/to/file.jsonld` to select an explicit file and skip generation
+and directory discovery. Repeat the option for companion documents.
+`--spdx-file` remains an alias. Import all West companion documents together
+to retain their cross-document relationships.
 
 ## SPDX generation options
 
@@ -78,3 +78,41 @@ when the command returns; default 3.0 generation continues streaming its output.
 Use `--timeout SECONDS` to adjust the generation deadline. See
 {ref}`operation-deadlines` for defaults
 and the separate interactive-server behavior.
+
+(migrating-existing-commands)=
+## Migrating existing commands
+
+West uses VulnScout v0.24's command-first syntax for the supported operations:
+`add`, `scan`, `refresh`, `match-condition`, `serve`, `report`, `export`, and
+`stop`. It does not expose every VulnScout maintenance or import command.
+West's `add` handles Zephyr SPDX input, with generation enabled unless
+`--no-generate` or explicit `--spdx` files are supplied.
+
+Legacy workflow syntax remains accepted with a deprecation warning:
+
+| Legacy invocation | Command-first equivalent |
+| --- | --- |
+| `west vulnscout [options]` | `west vulnscout add [options]` |
+| `west vulnscout --perform-scan [options]` | Run `add`, then `scan`, with the same scope and cache options. |
+| `west vulnscout --refresh-vulnerability-data [options]` | `west vulnscout refresh [options]` |
+| `west vulnscout --match-condition EXPR [options]` | Run `add`, then `match-condition EXPR`, with the same scope and cache options. |
+| `west vulnscout --serve [options]` | Run `add`, then `serve`, with the same cache options. |
+| `west vulnscout --stop` | `west vulnscout stop` |
+| `west vulnscout report --template NAME [options]` | `west vulnscout report NAME [options]` |
+| `west vulnscout export --format cdx16 [options]` | `west vulnscout export cdx [options]` |
+
+Unlike the old combined workflows, `scan`, `refresh`, `match-condition`, and
+`serve` do not ask West to generate or import an SBOM. Keep them separate from
+generation/input options and legacy workflow flags.
+Use `scan nvd osv`, `scan nvd,osv`, or `scan --nvd --osv` to select scanners.
+An unqualified `scan` selects all scanners.
+
+Scope options `-p`/`--project` and `-v`/`--variant` are accepted before or after
+the command. West always selects exactly one variant, defaulting to project
+`default` and variant `default`, even for `refresh` and `match-condition`.
+This is deliberately narrower than some upstream commands' all-variant or
+all-project defaults. `serve` opens the whole cache.
+
+In wrapper mode, West invokes the new VulnScout subcommands rather than its
+deprecated flags. Use an updated v0.24 wrapper. Direct mode continues to use
+the container's supported internal entrypoint and Flask CLI.

@@ -65,6 +65,9 @@ class VulnScoutCommandTests(unittest.TestCase):
         info = patch.object(self.command, 'inf')
         info.start()
         self.addCleanup(info.stop)
+        warning = patch.object(self.command, 'wrn')
+        warning.start()
+        self.addCleanup(warning.stop)
         self.parser = argparse.ArgumentParser()
         self.command.do_add_parser(self.parser.add_subparsers())
         self.interface_patch = patch.object(
@@ -152,8 +155,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
             help_text = parser.format_help()
         synopsis = help_text.split('\n\n', 1)[0]
         self.assertEqual(synopsis.splitlines(), [
-            'usage: west vulnscout -d BUILD_DIR [options]',
-            '       west vulnscout {report,export} -d BUILD_DIR [options]',
+            'usage: west vulnscout COMMAND [arguments] -d BUILD_DIR [options]',
             '       west vulnscout stop [container options]',
         ])
         groups = [
@@ -181,8 +183,8 @@ assert issubclass(process.VulnScoutError, RuntimeError)
         help_text = parser.format_help()
         examples = help_text.split('Examples:\n', 1)[1].split('\nNotes:\n', 1)[0]
         self.assertIn(
-            '    west vulnscout -d build --vulnscout-cmd vulnscout \\\n'
-            '      --vulnscout-image sfl:custom --serve --dev',
+            '    west vulnscout serve -d build --vulnscout-cmd vulnscout \\\n'
+            '      --vulnscout-image sfl:custom --dev',
             examples,
         )
         commands = []
@@ -198,19 +200,18 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                 commands.append(self.parse(*shlex.split(pending)[2:]))
                 pending = ''
         self.assertFalse(pending)
-        self.assertEqual(len(commands), 9)
+        self.assertEqual(len(commands), 10)
         self.assertEqual([args.action for args in commands],
-                         [None, None, None, None, 'report', 'export', None, None, 'stop'])
-        self.assertTrue(commands[1].perform_scan)
-        self.assertTrue(commands[1].serve)
-        self.assertTrue(commands[2].no_generate)
-        self.assertTrue(commands[3].refresh_vulnerability_data)
-        self.assertEqual(commands[4].format, 'html')
-        self.assertEqual(commands[5].format, 'spdx2')
-        self.assertEqual(commands[6].match_condition, 'cvss >= 9.0 and (pending or affected)')
-        self.assertEqual(commands[7].vulnscout_image, 'sfl:custom')
-        self.assertTrue(commands[7].dev)
-        self.assertIsNone(commands[8].build_dir)
+                         ['add', 'scan', 'scan', 'add', 'refresh', 'report', 'export',
+                          'match-condition', 'serve', 'stop'])
+        self.assertEqual(commands[2].parameters, ['osv', 'sbom-cve-check'])
+        self.assertTrue(commands[3].no_generate)
+        self.assertEqual(commands[5].format, 'html')
+        self.assertEqual(commands[6].format, 'spdx2')
+        self.assertEqual(commands[7].parameters, ['cvss >= 9.0 and (pending or affected)'])
+        self.assertEqual(commands[8].vulnscout_image, 'sfl:custom')
+        self.assertTrue(commands[8].dev)
+        self.assertIsNone(commands[9].build_dir)
 
     def test_stop_forms_skip_build_and_import(self):
         for arguments in [('stop',), ('--stop',), ('stop', '--stop')]:
@@ -249,7 +250,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
         args = self.parse('stop', '--vulnscout-cmd', '/demo/vulnscout')
         with patch.object(subprocess, 'run') as run:
             self.command.do_run(args, [])
-        self.assertEqual(run.call_args.args[0], ['/demo/vulnscout', '--stop'])
+        self.assertEqual(run.call_args.args[0], ['/demo/vulnscout', 'stop'])
         self.assertTrue(run.call_args.kwargs['check'])
 
     def test_unknown_action_is_rejected(self):
@@ -282,27 +283,34 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                         ):
                             self.command._run_vulnscout(args, ['/demo/app.jsonld'], '/cache')
                         if wrapper:
-                            expected = ['/demo/vulnscout']
-                            spdx_file = '/demo/app.jsonld'
-                        else:
-                            expected = [
-                                'podman', 'exec', '-e', 'VULNSCOUT_INPUTS_DIR=/tmp/west-inputs/inputs',
-                                '-w', '/scan', 'vulnscout', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
-                                '/cache/vulnscout/.west-vulnscout.lock', '3600', '/scan/src/entrypoint.sh',
-                            ]
-                            spdx_file = '/tmp/app.spdx.json'
+                            expected_commands = [[
+                                '/demo/vulnscout', 'add', '--project', 'demo', '--variant', 'native',
+                                '--spdx', '/demo/app.jsonld',
+                            ]]
+                            if perform_scan:
+                                expected_commands.append([
+                                    '/demo/vulnscout', 'scan', '--project', 'demo',
+                                    '--variant', 'native', 'all',
+                                ])
+                            if serve:
+                                expected_commands.append(['/demo/vulnscout', 'serve'])
+                            self.assertEqual([call.args[0] for call in run.call_args_list], expected_commands)
+                            continue
+                        expected = [
+                            'podman', 'exec', '-e', 'VULNSCOUT_INPUTS_DIR=/tmp/west-inputs/inputs',
+                            '-w', '/scan', 'vulnscout', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
+                            '/cache/vulnscout/.west-vulnscout.lock', '3600', '/scan/src/entrypoint.sh',
+                        ]
                         expected.extend([
                             '--project', 'demo', '--variant', 'native',
-                            '--add-spdx', spdx_file,
+                            '--add-spdx', '/tmp/app.spdx.json',
                         ])
                         if perform_scan:
                             expected.extend(['--perform-scans', 'all'])
-                        if wrapper and serve:
-                            expected.append('--serve')
-                        self.assertEqual(run.call_count, 2 if serve and not wrapper else 1)
+                        self.assertEqual(run.call_count, 2 if serve else 1)
                         self.assertEqual(run.call_args_list[0].args[0], expected)
                         self.assertTrue(run.call_args.kwargs['check'])
-                        if serve and not wrapper:
+                        if serve:
                             followup = run.call_args_list[1].args[0]
                             self.assertEqual(followup[-5:], [
                                 '--project', 'demo', '--variant', 'native', '--serve',
@@ -329,6 +337,176 @@ assert issubclass(process.VulnScoutError, RuntimeError)
             scan.assert_called_once_with(
                 args, files, config.resolve_data_dir(args, build_dir)
             )
+            self.command.wrn.assert_called_once()
+
+    def test_command_first_stored_actions_skip_generation_and_import(self):
+        cases = [
+            (['scan'], ['--perform-scans', 'all'],
+             ['scan', '--project', 'demo', '--variant', 'native', 'all']),
+            (['scan', 'osv,nvd', 'nvd', '--osv'], ['--perform-scans', 'nvd,osv'],
+             ['scan', '--project', 'demo', '--variant', 'native', 'nvd,osv']),
+            (['scan', '--all', '--osv'], ['--perform-scans', 'all'],
+             ['scan', '--project', 'demo', '--variant', 'native', 'all']),
+            (['refresh'], ['--refresh-vulnerability-data'],
+             ['refresh', '--project', 'demo', '--variant', 'native']),
+            (['match-condition', 'cvss >= 9.0'], ['--match-condition', 'cvss >= 9.0'],
+             ['match-condition', '--project', 'demo', '--variant', 'native', 'cvss >= 9.0']),
+            (['serve'], ['--serve'], ['serve']),
+        ]
+        for wrapper in (False, True):
+            for arguments, native, wrapped in cases:
+                with (
+                    self.subTest(wrapper=wrapper, arguments=arguments),
+                    tempfile.TemporaryDirectory() as directory,
+                    patch.object(self.command, '_run_west_spdx') as generate,
+                    patch.object(self.command, '_resolve_spdx_files') as resolve,
+                    patch.object(containers, 'resolve_engine', return_value='podman'),
+                    patch.object(containers.Container, 'ensure_running'),
+                    patch.object(containers.Container, 'input_workspace',
+                                 return_value=contextlib.nullcontext('/tmp/private-inputs')),
+                    patch.object(containers.Container, 'stage_files') as stage,
+                    patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run,
+                ):
+                    self.command.wrn.reset_mock()
+                    flags = ['--vulnscout-cmd', '/demo/vulnscout'] if wrapper else []
+                    args = self.parse('-p', 'demo', *arguments, '-d', directory, '-v', 'native', *flags)
+                    self.command.do_run(args, [])
+                    generate.assert_not_called()
+                    resolve.assert_not_called()
+                    stage.assert_not_called()
+                    self.command.wrn.assert_not_called()
+                    run.assert_called_once()
+                    command = run.call_args.args[0]
+                    if wrapper:
+                        self.assertEqual(command, ['/demo/vulnscout', *wrapped])
+                    else:
+                        self.assertEqual(command[-len(native):], native)
+                        self.assertIn('VULNSCOUT_INPUTS_DIR=/tmp/private-inputs/inputs', command)
+                        self.assertNotIn('--add-spdx', command)
+                        if arguments[0] == 'serve':
+                            self.assertNotIn(containers.PROCESSING_LOCK_PROGRAM, command)
+                        else:
+                            self.assertIn(containers.PROCESSING_LOCK_PROGRAM, command)
+                    timeout = run.call_args.kwargs['timeout']
+                    if arguments[0] == 'serve':
+                        self.assertIsNone(timeout)
+                    else:
+                        self.assertGreater(timeout, 0)
+
+    def test_command_first_policy_preserves_matches_and_cleanup(self):
+        for wrapper in (False, True):
+            for status in (0, 2):
+                with (
+                    self.subTest(wrapper=wrapper, status=status),
+                    tempfile.TemporaryDirectory() as directory,
+                    patch.object(containers, 'resolve_engine', return_value='podman'),
+                    patch.object(containers.Container, 'ensure_running'),
+                    patch.object(containers.Container, 'input_workspace',
+                                 return_value=contextlib.nullcontext('/tmp/private-inputs')),
+                    patch.object(self.command, '_stop_vulnscout_container') as stop,
+                    patch.object(subprocess, 'run') as run,
+                ):
+                    if status:
+                        run.side_effect = subprocess.CalledProcessError(status, 'vulnscout')
+                    flags = ['--vulnscout-cmd', '/demo/vulnscout'] if wrapper else []
+                    args = self.parse('match-condition', 'pending', '-d', directory, '--stop-after-run', *flags)
+                    if status:
+                        with self.assertRaises(SystemExit) as caught:
+                            self.command.do_run(args, [])
+                        self.assertEqual(caught.exception.code, 2)
+                    else:
+                        self.command.do_run(args, [])
+                    stop.assert_called_once_with(args)
+                    command = run.call_args.args[0]
+                    self.assertEqual(command[command.index('--project') + 1], 'default')
+                    self.assertEqual(command[command.index('--variant') + 1], 'default')
+
+    def test_command_first_rejects_invalid_or_mixed_arguments_before_execution(self):
+        cases = [
+            (['scan', 'unknown'], 'scan types'),
+            (['scan', 'nvd,'], 'scan types'),
+            (['scan', '--spdx', '/tmp/app.jsonld'], 'uses stored data'),
+            (['refresh', '--no-generate'], 'uses stored data'),
+            (['serve', '--spdx-dir', '/tmp'], 'uses stored data'),
+            (['match-condition', 'pending', '--include-sdk'], 'uses stored data'),
+            (['refresh', '--perform-scan'], 'legacy workflow flags'),
+            (['scan', '--refresh-vulnerability-data'], 'legacy workflow flags'),
+            (['scan', '--serve'], 'legacy workflow flags'),
+            (['scan', '--match-condition', 'pending'], 'cannot be combined'),
+            (['match-condition'], 'exactly one'),
+            (['match-condition', '   '], 'exactly one'),
+            (['match-condition', 'pending', 'affected'], 'exactly one'),
+            (['match-condition', 'pending', '--match-condition', 'affected'], 'exactly one'),
+            (['report', 'one.adoc', 'two.adoc'], 'one template'),
+            (['report', 'one.adoc', '--template', 'two.adoc'], 'one template'),
+            (['export', 'spdx', '--format', 'cdx16'], 'incompatible'),
+            (['export', 'unknown'], 'one kind'),
+            (['export', 'spdx', 'cdx'], 'one kind'),
+            (['add', 'unexpected'], 'positional arguments'),
+            (['add', '--all'], 'require.*scan'),
+            (['add', '--stop'], 'cannot be combined with --stop'),
+            (['scan', '--stop'], 'cannot be combined with --stop'),
+            (['serve', '--stop'], 'cannot be combined with --stop'),
+            (['refresh', '--stop'], 'cannot be combined with --stop'),
+            (['match-condition', 'pending', '--stop'], 'cannot be combined with --stop'),
+            (['serve', '--stop-after-run'], 'cannot be used'),
+        ]
+        with (
+            patch.object(self.command, '_run_west_spdx') as generate,
+            patch.object(self.command, '_run_vulnscout') as execute,
+            patch.object(self.command, 'die', side_effect=fail),
+        ):
+            for arguments, message in cases:
+                with self.subTest(arguments=arguments), self.assertRaisesRegex(RuntimeError, message):
+                    self.command.do_run(self.parse(*arguments), [])
+            generate.assert_not_called()
+            execute.assert_not_called()
+
+    def test_add_explicit_spdx_inputs_skip_generation_and_use_modern_wrapper(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(self.command, '_run_west_spdx') as generate,
+            patch.object(self.command, '_resolve_spdx_files',
+                         return_value=['/tmp/app one.jsonld', '/tmp/app two.jsonld']),
+            patch.object(subprocess, 'run') as run,
+        ):
+            args = self.parse(
+                'add', '-d', directory, '--spdx', '/tmp/app one.jsonld', '--spdx', '/tmp/app two.jsonld',
+                '--vulnscout-cmd', '/demo/vulnscout',
+            )
+            self.command.do_run(args, [])
+            generate.assert_not_called()
+            self.assertEqual(run.call_args.args[0], [
+                '/demo/vulnscout', 'add', '--project', 'default', '--variant', 'default',
+                '--spdx', '/tmp/app one.jsonld', '--spdx', '/tmp/app two.jsonld',
+            ])
+
+    def test_export_kinds_select_matching_default_formats(self):
+        for kind, expected in [('spdx', 'spdx3'), ('cdx', 'cdx16'), ('openvex', 'openvex')]:
+            with self.subTest(kind=kind):
+                args = self.parse('export', kind)
+                config.normalize_command(args)
+                parameters, filename = config.stored_output_spec(args)
+                self.assertEqual(parameters, ['export', '--format', expected])
+                self.assertEqual(filename, config.SBOM_EXPORT_FILES[expected])
+
+    def test_legacy_wrapper_sequences_bound_finite_work_and_stop_on_failure(self):
+        args = self.parse(
+            '--perform-scan', '--refresh-vulnerability-data', '--match-condition', 'pending',
+            '--vulnscout-cmd', '/demo/vulnscout',
+        )
+        for status in (1, 2):
+            with (
+                self.subTest(status=status),
+                patch.object(subprocess, 'run', side_effect=subprocess.CalledProcessError(status, 'add')) as run,
+                self.assertRaisesRegex(process.VulnScoutError, f'exit code {status}'),
+            ):
+                self.command._run_vulnscout(args, ['/tmp/app.jsonld'], '/cache')
+            run.assert_called_once()
+        args = self.parse('--perform-scan', '--serve', '--timeout', '17', '--vulnscout-cmd', '/demo/vulnscout')
+        with patch.object(subprocess, 'run') as run:
+            self.command._run_vulnscout(args, ['/tmp/app.jsonld'], '/cache')
+        self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list], [17, 17, None])
 
     def test_new_container_uses_native_web_settings(self):
         for engine in ['podman', 'docker']:
@@ -444,20 +622,24 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                     generate.assert_not_called()
                     resolve.assert_not_called()
                     stage.assert_not_called()
-                    expected = ['/demo/vulnscout'] if wrapper else ['podman', 'exec']
-                    if not wrapper:
-                        expected.extend([
-                            '-e', 'VULNSCOUT_INPUTS_DIR=/tmp/west-inputs/inputs',
-                            '-w', '/scan', 'vulnscout', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
-                            '/cache/vulnscout/.west-vulnscout.lock', '3600', '/scan/src/entrypoint.sh',
-                        ])
+                    if wrapper:
+                        expected_commands = [[
+                            '/demo/vulnscout', 'refresh', '--project', 'demo', '--variant', 'native',
+                        ]]
+                        if serve:
+                            expected_commands.append(['/demo/vulnscout', 'serve'])
+                        self.assertEqual([call.args[0] for call in run.call_args_list], expected_commands)
+                        continue
+                    expected = [
+                        'podman', 'exec', '-e', 'VULNSCOUT_INPUTS_DIR=/tmp/west-inputs/inputs',
+                        '-w', '/scan', 'vulnscout', 'python', '-c', containers.PROCESSING_LOCK_PROGRAM,
+                        '/cache/vulnscout/.west-vulnscout.lock', '3600', '/scan/src/entrypoint.sh',
+                    ]
                     expected.extend([
                         '--project', 'demo', '--variant', 'native',
                         '--refresh-vulnerability-data',
                     ])
-                    if serve and wrapper:
-                        expected.append('--serve')
-                    self.assertEqual(run.call_count, 2 if serve and not wrapper else 1)
+                    self.assertEqual(run.call_count, 2 if serve else 1)
                     self.assertEqual(run.call_args_list[0].args[0], expected)
 
     def test_scan_with_refresh_still_generates_and_imports(self):
@@ -474,11 +656,11 @@ assert issubclass(process.VulnScoutError, RuntimeError)
             ):
                 self.command.do_run(args, [])
             generate.assert_called_once()
-            run.assert_called_once()
-            self.assertEqual(run.call_args.args[0], [
-                '/demo/vulnscout', '--project', 'default', '--variant', 'default',
-                '--add-spdx', files[0], '--perform-scans', 'all',
-                '--refresh-vulnerability-data',
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                ['/demo/vulnscout', 'add', '--project', 'default', '--variant', 'default',
+                 '--spdx', files[0]],
+                ['/demo/vulnscout', 'scan', '--project', 'default', '--variant', 'default', 'all'],
+                ['/demo/vulnscout', 'refresh', '--project', 'default', '--variant', 'default'],
             ])
 
     def test_match_condition_forwarding_and_exit_status(self):
@@ -507,7 +689,11 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                     else:
                         self.assertEqual(self.command._run_vulnscout(args, [], '/cache'), status)
                     command = run.call_args.args[0]
-                    self.assertEqual(command[-2:], ['--match-condition', condition])
+                    if wrapper:
+                        self.assertEqual(command[1], 'match-condition')
+                        self.assertEqual(command[-1], condition)
+                    else:
+                        self.assertEqual(command[-2:], ['--match-condition', condition])
                     self.assertIn('zephyr', command)
                     self.assertIn('native', command)
 
@@ -595,9 +781,9 @@ assert issubclass(process.VulnScoutError, RuntimeError)
             for output_format in [None, 'html', 'pdf']:
                 with self.subTest(engine=engine, format=output_format), tempfile.TemporaryDirectory() as build_dir:
                     options = [
-                        'report', '-d', build_dir, '--container-engine', engine,
+                        'report', 'all_assessments.adoc', '-d', build_dir, '--container-engine', engine,
                         '--container-name', 'demo', '--project', 'zephyr',
-                        '--variant', 'native', '--template', 'all_assessments.adoc',
+                        '--variant', 'native',
                     ]
                     if output_format:
                         options.extend(['--format', output_format, '--output-dir', build_dir])
@@ -778,8 +964,11 @@ assert issubclass(process.VulnScoutError, RuntimeError)
                     self.subTest(engine=engine, format=output_format),
                     tempfile.TemporaryDirectory() as build_dir,
                 ):
+                    kind = 'spdx' if output_format.startswith('spdx') else (
+                        'cdx' if output_format.startswith('cdx') else 'openvex'
+                    )
                     args = self.parse(
-                        'export', '-d', build_dir, '--container-engine', engine,
+                        'export', kind, '-d', build_dir, '--container-engine', engine,
                         '--container-name', 'demo', '--project', 'zephyr', '--variant', 'native',
                         '--format', output_format, '--output-dir', build_dir,
                     )
@@ -1164,7 +1353,7 @@ assert issubclass(process.VulnScoutError, RuntimeError)
         for serve, expected in [(False, 12), (True, None)]:
             args = self.parse('--vulnscout-cmd', 'wrapper', '--timeout', '12', *(['--serve'] if serve else []))
             with self.subTest(serve=serve), patch.object(subprocess, 'run') as run:
-                self.command._run_vulnscout(args, [], '/cache')
+                self.command._run_vulnscout(args, ['/tmp/app.jsonld'], '/cache')
                 self.assertEqual(run.call_args.kwargs['timeout'], expected)
 
     def test_timeout_diagnostics_decode_partial_output(self):

@@ -66,19 +66,20 @@ class VulnScoutIntegrationTests(unittest.TestCase):
             self.container(['rm', '-f', self.name])
             self.name = None
 
-    def command(self, variant, *options):
+    def command(self, variant, *options, action='add'):
         arguments = [
-            sys.executable, '-c', WORKER, str(COMMAND_PATH), '-d', str(self.build),
-            '--no-generate', '--container-engine', self.engine, '--container-name', self.name,
+            sys.executable, '-c', WORKER, str(COMMAND_PATH), action, '-d', str(self.build),
+            '--container-engine', self.engine, '--container-name', self.name,
             '--vulnscout-data-dir', str(self.cache), '--project', 'isolation-check', '--variant', variant,
         ]
-        for fixture in self.fixtures:
-            arguments.extend(['--spdx-file', str(fixture)])
+        if action == 'add':
+            for fixture in self.fixtures:
+                arguments.extend(['--spdx', str(fixture)])
         return [*arguments, *options]
 
-    def run_west(self, variant, *options, expected=0):
+    def run_west(self, variant, *options, action='add', expected=0):
         result = subprocess.run(
-            self.command(variant, *options), capture_output=True, text=True, timeout=180,
+            self.command(variant, *options, action=action), capture_output=True, text=True, timeout=180,
         )
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
@@ -140,13 +141,21 @@ class VulnScoutIntegrationTests(unittest.TestCase):
 
         self.run_west('first')
         self.assert_no_workspaces()
+
+        def scan_ids():
+            return {scan['id'] for scan in json.loads(self.container([
+                'exec', '-w', interface.workdir, self.name,
+                *interface.cli, 'list-scans', '--json',
+            ]).stdout)}
+
+        initial_scans = scan_ids()
         other_cache = self.directory / 'other-cache'
         result = self.run_west('wrong-cache', '--vulnscout-data-dir', str(other_cache), expected=1)
         self.assertIn('must mount the selected cache', result.stderr)
         self.assertFalse(other_cache.exists())
 
         with (self.directory / 'serve.log').open('w') as log:
-            server = subprocess.Popen(self.command('first', '--serve'), stdout=log, stderr=subprocess.STDOUT)
+            server = subprocess.Popen(self.command('first', action='serve'), stdout=log, stderr=subprocess.STDOUT)
             try:
                 for _ in range(120):
                     self.assertIsNone(server.poll(), (self.directory / 'serve.log').read_text())
@@ -161,8 +170,16 @@ class VulnScoutIntegrationTests(unittest.TestCase):
                 else:
                     self.fail((self.directory / 'serve.log').read_text())
                 self.assert_no_workspaces()
+                self.assertEqual(scan_ids(), initial_scans)
                 self.run_west('second')
-                self.run_west('first', '--refresh-vulnerability-data', '--match-condition', 'cvss >= 9.0')
+                imported_scans = scan_ids()
+                self.assertGreater(len(imported_scans), len(initial_scans))
+                self.run_west('first', action='refresh')
+                self.run_west('first', 'cvss >= 9.0', action='match-condition')
+                self.assertEqual(scan_ids(), imported_scans)
+                result = self.run_west('first', 'nvd', '--timeout', '0.1', action='scan', expected=1)
+                self.assertIn('timed out', result.stderr)
+                self.run_west('first', 'cvss >= 9.0', action='match-condition')
                 self.assertIsNone(server.poll())
                 self.assert_no_workspaces()
                 projects = json.loads(self.container([

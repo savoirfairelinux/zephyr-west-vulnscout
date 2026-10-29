@@ -3,4 +3,4 @@ west-commands:
     commands:
       - name: vulnscout
         class: ZephyrVulnScout
-        help: generate SBOMs, scan vulnerabilities, and export stored VulnScout results
+        help: add SBOMs, scan, refresh, serve, and share stored VulnScout results

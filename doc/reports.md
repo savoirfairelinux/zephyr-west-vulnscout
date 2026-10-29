@@ -5,10 +5,9 @@
 After importing and scanning a project, generate a report from its stored data:
 
 ```sh
-west vulnscout report -d demo/mbedtls_sbom/build \
-  --container-engine podman \
+west vulnscout report summary.adoc -d demo/mbedtls_sbom/build \
   --project zephyr_demo --variant mbedtls_native_sim \
-  --template summary.adoc --format html \
+  --format html \
   --output-dir demo/mbedtls_sbom/reports
 ```
 
@@ -20,7 +19,7 @@ operations are rejected.
 
 | Option | Purpose |
 | --- | --- |
-| `--template NAME` | Select an installed template; the default is `summary.adoc`. |
+| `report NAME` | Select one installed template. Omitting NAME defaults to `summary.adoc`. `--template NAME` remains an alias. |
 | `--format {html,pdf}` | Convert an AsciiDoc template to HTML or PDF. |
 | `--output-dir PATH` | Select the host directory; the default is `<build-dir>/vulnscout-reports`. |
 

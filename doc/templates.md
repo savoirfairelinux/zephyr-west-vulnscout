@@ -40,14 +40,13 @@ Then select it by filename. Replace `/path/to/existing/cache` with the host
 directory mounted at `/cache/vulnscout` in that container:
 
 ```sh
-west vulnscout report -d demo/mbedtls_sbom/build \
-  --container-engine podman \
+west vulnscout report my-report.adoc -d demo/mbedtls_sbom/build \
   --vulnscout-data-dir /path/to/existing/cache \
   --project zephyr_demo --variant mbedtls_native_sim \
-  --template my-report.adoc --format html --output-dir reports
+  --format html --output-dir reports
 ```
 
-The generated report is `reports/my-report.adoc.html`. `--template` accepts an
+The generated report is `reports/my-report.adoc.html`. The template argument accepts an
 installed filename, not a host path. See
 [Report Generation](reports.md) for formats and output options.
 

@@ -5,10 +5,9 @@
 After importing an SBOM, export the selected project's variant from VulnScout:
 
 ```sh
-west vulnscout export -d demo/mbedtls_sbom/build \
-  --container-engine podman \
+west vulnscout export spdx -d demo/mbedtls_sbom/build \
   --project zephyr_demo --variant mbedtls_native_sim \
-  --format spdx3 --output-dir exports
+  --output-dir exports
 ```
 
 This writes `exports/sbom_spdx_v3_0.spdx.json` on the host. Export reads the
@@ -20,6 +19,12 @@ VulnScout's stored data. Supported formats include vulnerability and assessment
 information where the output format supports it.
 
 ## Output formats
+
+Select one kind: `export spdx` (default SPDX 3.0), `export cdx` (default
+CycloneDX 1.6), or `export openvex`. Use `--format` to select a version within
+that kind. West exports one kind per command and does not expose the upstream
+`custom-data`, `custom-openvex`, or `context` exports.
+The legacy form with only `--format` remains supported.
 
 | `--format` | Format | Output filename |
 | --- | --- | --- |
@@ -33,8 +38,7 @@ information where the output format supports it.
 For SPDX 2.3, run the same command with `--format spdx2`:
 
 ```sh
-west vulnscout export -d demo/mbedtls_sbom/build \
-  --container-engine podman \
+west vulnscout export spdx -d demo/mbedtls_sbom/build \
   --project zephyr_demo --variant mbedtls_native_sim \
   --format spdx2 --output-dir exports
 ```
@@ -53,8 +57,7 @@ When reusing a container whose cache differs from the build directory's
 default, specify its host mount explicitly:
 
 ```sh
-west vulnscout export -d demo/mbedtls_sbom/build \
-  --container-engine podman \
+west vulnscout export cdx -d demo/mbedtls_sbom/build \
   --vulnscout-data-dir /path/to/existing/cache \
   --project zephyr_demo --variant mbedtls_native_sim \
   --format cdx16 --output-dir exports

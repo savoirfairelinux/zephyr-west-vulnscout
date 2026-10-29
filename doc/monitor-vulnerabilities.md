@@ -2,24 +2,22 @@
 
 ## Evaluate a match condition
 
-Use VulnScout's `--match-condition` mechanism to fail a CI job when a
+Use VulnScout's `match-condition` command to fail a CI job when a
 vulnerability satisfies your policy:
 
 ```sh
-west vulnscout -d demo/mbedtls_sbom/build \
-  --container-engine podman \
-  --project zephyr_demo --variant mbedtls_native_sim \
-  --match-condition 'cvss >= 9.0 and (pending or affected)'
+west vulnscout match-condition 'cvss >= 9.0 and (pending or affected)' \
+  -d demo/mbedtls_sbom/build \
+  --project zephyr_demo --variant mbedtls_native_sim
 ```
 
-The normal workflow still generates and imports an SBOM. The condition is
-evaluated against vulnerability data stored in VulnScout for the selected
-variant. It does not request a full vulnerability scan or automatically
-refresh provider metadata.
+The condition is evaluated against vulnerability data stored in VulnScout for
+the selected variant. West does not generate or stage an SBOM for this command.
+It does not request vulnerability scanners or automatically refresh provider
+metadata.
 
-To discover vulnerabilities with all scanners before evaluation, add
-`--perform-scan`. To import existing SPDX files instead of regenerating them,
-add `--no-generate`. See
+To discover vulnerabilities before evaluation, run `west vulnscout scan` with
+the same build directory, project, and variant first. See
 [Vulnerability Scanning](vulnerability-scanning.md).
 
 Matching vulnerability IDs are printed in the command output.
@@ -75,26 +73,16 @@ To refresh all stored vulnerability metadata in the selected variant before
 evaluation, first run a separate refresh:
 
 ```sh
-west vulnscout -d demo/mbedtls_sbom/build \
-  --container-engine podman \
-  --project zephyr_demo --variant mbedtls_native_sim \
-  --refresh-vulnerability-data
+west vulnscout refresh -d demo/mbedtls_sbom/build \
+  --project zephyr_demo --variant mbedtls_native_sim
 ```
 
-Then run the condition command above. Add `--no-generate` to reuse existing
-SPDX files; they are still imported.
+Then run the condition command above. For a full workflow, run `add`, `scan`,
+`refresh`, and `match-condition` as separate commands in that order.
 
-For a single generation, import, scan, enrichment, and evaluation workflow,
-combine `--perform-scan --refresh-vulnerability-data --match-condition
-'known_exploitable or epss >= 50%'`.
-
-Combining only `--refresh-vulnerability-data` and `--match-condition` skips
-West's SBOM generation and staging. However, native VulnScout processing can
-reread files registered with the latest scan or process inputs left in the
-container. In that processing path, refresh applies to encountered
-vulnerabilities, not necessarily every stored finding in the selected
-variant. It is not a read-only database check; use the separate refresh above
-when all stored findings must be refreshed.
+Condition evaluation uses VulnScout's native processing path, which can reread
+files registered with the latest scan. Direct mode isolates pending input files
+from other invocations. Wrapper mode retains VulnScout's own input handling.
 
 Scores and exploitation flags can be missing or stale until their providers
 are refreshed. See [Refresh Vulnerability Data](vulnerability-data.md).
@@ -124,10 +112,9 @@ including when `set -e` is enabled:
 
 ```sh
 status=0
-west vulnscout -d demo/mbedtls_sbom/build \
-  --container-engine podman --no-generate \
-  --project zephyr_demo --variant mbedtls_native_sim \
-  --match-condition 'cvss >= 9.0' || status=$?
+west vulnscout match-condition 'cvss >= 9.0' \
+  -d demo/mbedtls_sbom/build \
+  --project zephyr_demo --variant mbedtls_native_sim || status=$?
 
 case "$status" in
   0) echo "Policy passed" ;;
@@ -137,6 +124,6 @@ esac
 exit "$status"
 ```
 
-`--match-condition` cannot be combined with `--serve`. It can be combined with
+`match-condition` is a separate command from `serve`. It can be combined with
 `--stop-after-run`; cleanup runs after a completed evaluation even when the
 condition matches, and the command still exits with `2`.

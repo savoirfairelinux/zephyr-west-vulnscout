@@ -13,15 +13,15 @@ The extension connects Zephyr's SPDX output to the VulnScout workflow:
 
 ## What it provides
 
-- **Generate and import:** `west vulnscout` generates SPDX SBOMs via `west spdx`
+- **Generate and import:** `west vulnscout add` generates SPDX SBOMs via `west spdx`
   (default: SPDX 3.0) and imports them. Add `--no-generate` to reuse existing files.
-- **Scan:** `west vulnscout --perform-scan` imports the SBOM and runs all
-  vulnerability scanners.
-- **Refresh:** `west vulnscout --refresh-vulnerability-data` updates stored
+- **Scan:** `west vulnscout scan` runs all or selected vulnerability scanners
+  against stored data.
+- **Refresh:** `west vulnscout refresh` updates stored
   vulnerability metadata without importing or rescanning.
-- **Assess:** `west vulnscout --serve` opens the VulnScout web interface after
-  processing, for reviewing findings and recording assessments.
-- **Enforce:** `west vulnscout --match-condition 'EXPRESSION'` evaluates a
+- **Assess:** `west vulnscout serve` opens the VulnScout web interface for
+  reviewing findings and recording assessments, without another import.
+- **Enforce:** `west vulnscout match-condition 'EXPRESSION'` evaluates a
   vulnerability policy: exit `0` for no match, `2` for a match, and `1` on errors.
 - **Report:** `west vulnscout report` generates reports from stored results and
   copies them to the host without importing or rescanning.
@@ -50,10 +50,10 @@ west update zephyr-west-vulnscout
 west help vulnscout
 ```
 
-The help groups options by feature and includes examples for imports, scanning,
-refresh, reports, exports, policy checks, and container lifecycle. With no
-action, the command generates and imports an SBOM. Scanning requires
-`--perform-scan`. The `report` and `export` actions use stored data instead.
+Commands follow VulnScout v0.24's command-first syntax. `add` generates and
+imports an SBOM. The other data commands use stored results.
+Legacy workflow flags remain accepted with a deprecation warning.
+See [Migrating existing commands](doc/sbom-generation.md#migrating-existing-commands).
 
 ## Example usage
 
@@ -68,7 +68,7 @@ Omitting `--project` and `--variant` selects project `default` and variant `defa
 Generate SPDX files and import them without requesting a full vulnerability scan:
 
 ```sh
-ZEPHYR_BASE="$PWD/zephyr" west vulnscout \
+ZEPHYR_BASE="$PWD/zephyr" west vulnscout add \
   -d demo/mbedtls_sbom/build \
   --project zephyr_demo \
   --variant mbedtls_native_sim
@@ -77,7 +77,7 @@ ZEPHYR_BASE="$PWD/zephyr" west vulnscout \
 If SPDX files already exist, reuse them with `--no-generate`:
 
 ```sh
-ZEPHYR_BASE="$PWD/zephyr" west vulnscout \
+ZEPHYR_BASE="$PWD/zephyr" west vulnscout add \
   -d demo/mbedtls_sbom/build \
   --project zephyr_demo \
   --variant mbedtls_native_sim \
@@ -94,55 +94,49 @@ for cache selection, concurrent operations, and image compatibility.
 
 ### 02 - Enrich
 
-Import the existing SPDX files and run all vulnerability scanners:
+Run all vulnerability scanners against the imported variant:
 
 ```sh
-ZEPHYR_BASE="$PWD/zephyr" west vulnscout \
+west vulnscout scan \
   -d demo/mbedtls_sbom/build \
-  --no-generate \
   --project zephyr_demo \
-  --variant mbedtls_native_sim \
-  --perform-scan
+  --variant mbedtls_native_sim
 ```
 
-`--perform-scan` passes `--perform-scans all` to VulnScout in both direct and
-wrapper modes. It still imports the SBOM. It is not a scan-only action.
+Scanning does not generate or import another SBOM. Select individual scanners
+with `scan nvd osv`, for example.
 Full scans may require network access and scanner credentials.
 
 To refresh vulnerability metadata already stored for the selected variant
 without generating or importing another SBOM:
 
 ```sh
-west vulnscout -d demo/mbedtls_sbom/build \
-  --project zephyr_demo --variant mbedtls_native_sim \
-  --refresh-vulnerability-data
+west vulnscout refresh -d demo/mbedtls_sbom/build \
+  --project zephyr_demo --variant mbedtls_native_sim
 ```
 
 This updates metadata for known vulnerabilities without rerunning scanners.
 No SPDX files are required. See [Vulnerability Data](doc/vulnerability-data.md)
-for refresh behavior and combined scan options.
+for refresh behavior.
 
 ### 03 - Assess
 
-Refresh stored metadata and open the web interface to review findings, record
+Open the web interface to review findings, record
 assessment statuses, and document your rationale:
 
 ```sh
-west vulnscout -d demo/mbedtls_sbom/build \
-  --project zephyr_demo --variant mbedtls_native_sim \
-  --refresh-vulnerability-data --serve
+west vulnscout serve -d demo/mbedtls_sbom/build
 ```
 
-In direct mode, processing completes before the UI starts at
-http://localhost:7275/. `--serve` alone still generates and imports an SBOM.
-The refresh-only combination above avoids that, but updates stored metadata.
+Open http://localhost:7275/ and select the imported project and variant.
+Serving does not import, scan, or refresh data.
 If the UI is already running, open its existing URL instead of starting another
 web server. Imports and refreshes can run separately while the UI remains open.
 Pressing Ctrl+C in an attached direct-mode session stops the container.
 
 Assessment happens in VulnScout, not through a separate West assessment command.
 The diagram's optional AI assistance belongs to VulnScout and requires separate
-configuration. It is not enabled by `--serve`.
+configuration. It is not enabled by `serve`.
 
 Direct mode accepts `VULNSCOUT_ENV_FLASK_RUN_HOST` and
 `VULNSCOUT_ENV_FLASK_RUN_PORT`, with native `FLASK_RUN_HOST`/`FLASK_RUN_PORT`
@@ -152,20 +146,17 @@ See [Custom port and browser URL](doc/interactive-mode.md#custom-port-and-browse
 
 ### 04 - Enforce
 
-Evaluate a vulnerability policy against stored data after refreshing its
-metadata, without generating or importing another SBOM:
+Evaluate a vulnerability policy against stored data:
 
 ```sh
-west vulnscout -d demo/mbedtls_sbom/build \
-  --project zephyr_demo --variant mbedtls_native_sim \
-  --refresh-vulnerability-data \
-  --match-condition 'cvss >= 9.0 and (pending or affected)'
+west vulnscout match-condition 'cvss >= 9.0 and (pending or affected)' \
+  -d demo/mbedtls_sbom/build \
+  --project zephyr_demo --variant mbedtls_native_sim
 ```
 
 Exit codes distinguish no match (`0`), execution errors (`1`), and a policy
-match (`2`). Add `--perform-scan` to request all scanners before evaluation.
-Conditions use stored metadata unless it is explicitly refreshed, and cannot
-be combined with `--serve`.
+match (`2`). Run `scan` or `refresh` separately before evaluation when needed.
+Conditions use stored metadata unless it is explicitly refreshed.
 See [Monitor Vulnerabilities](doc/monitor-vulnerabilities.md) for tokens,
 examples, scope, refresh behavior, and CI integration.
 
@@ -178,9 +169,9 @@ Generate reports and export SBOM or VEX data from the same stored variant.
 After importing and scanning a project, generate a report from its stored data:
 
 ```sh
-west vulnscout report -d demo/mbedtls_sbom/build \
+west vulnscout report summary.adoc -d demo/mbedtls_sbom/build \
   --project zephyr_demo --variant mbedtls_native_sim \
-  --template summary.adoc --format html \
+  --format html \
   --output-dir demo/mbedtls_sbom/reports
 ```
 
@@ -192,13 +183,13 @@ and [Writing Report Templates](doc/templates.md) for custom-template installatio
 #### Export stored SBOM data
 
 ```sh
-west vulnscout export -d demo/mbedtls_sbom/build \
+west vulnscout export spdx -d demo/mbedtls_sbom/build \
   --project zephyr_demo --variant mbedtls_native_sim \
-  --format spdx3 --output-dir exports
+  --output-dir exports
 ```
 
 This writes `exports/sbom_spdx_v3_0.spdx.json` without importing or rescanning.
-Use `--format openvex` to export assessments as OpenVEX.
+Use `export openvex` to export assessments as OpenVEX.
 Both report and export require direct container mode rather than a wrapper.
 See [Exporting SBOM Files](doc/exports.md) for supported formats, filenames,
 scope selection, and errors.
@@ -208,7 +199,7 @@ scope selection, and errors.
 To stop the VulnScout container cleanly after task completion:
 
 ```sh
-ZEPHYR_BASE="$PWD/zephyr" west vulnscout \
+ZEPHYR_BASE="$PWD/zephyr" west vulnscout add \
   -d demo/mbedtls_sbom/build \
   --no-generate \
   --project zephyr_demo \
@@ -222,8 +213,8 @@ To stop the container immediately:
 west vulnscout stop
 ```
 
-The existing `west vulnscout --stop` syntax remains supported. Both forms
-accept `--container-engine`, `--container-name`, and `--vulnscout-cmd`.
+The legacy `west vulnscout --stop` syntax remains supported with a warning.
+Both forms accept `--container-engine`, `--container-name`, and `--vulnscout-cmd`.
 Neither requires a build directory. Stopping removes the container, but
 preserves its host-mounted data.
 
@@ -231,13 +222,11 @@ If you prefer using the VulnScout wrapper script instead of direct container
 exec mode:
 
 ```sh
-ZEPHYR_BASE="$PWD/zephyr" west vulnscout \
+west vulnscout serve \
   -d demo/mbedtls_sbom/build \
-  --project zephyr_demo \
-  --variant mbedtls_native_sim \
   --vulnscout-cmd /path/to/vulnscout \
   --vulnscout-image sfl:custom \
-  --serve --dev
+  --dev
 ```
 
 `--vulnscout-image` is interpreted as `repo[:tag]`. If the tag is omitted,

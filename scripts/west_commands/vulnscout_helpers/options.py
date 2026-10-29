@@ -38,6 +38,7 @@ SBOM_EXPORT_FILES = {
     'cdx16': 'sbom_cyclonedx_v1_6.cdx.json',
     'openvex': 'openvex.json',
 }
+SCANNERS = ('grype', 'nvd', 'osv', 'sbom-cve-check')
 
 
 def positive_timeout(value: str) -> float:
@@ -136,7 +137,7 @@ def validate_options(args: argparse.Namespace) -> None:
         )
     if args.template is not None and args.action != 'report':
         raise VulnScoutError('--template requires `west vulnscout report`')
-    if args.action in ('report', 'export') and args.stop:
+    if args.action not in (None, 'stop') and args.stop:
         raise VulnScoutError(f'{args.action} cannot be combined with --stop')
     if args.action == 'stop' or args.stop:
         return
@@ -149,6 +150,60 @@ def validate_options(args: argparse.Namespace) -> None:
             raise VulnScoutError('--dev is only supported with --vulnscout-cmd (wrapper mode)')
         if args.serve and args.stop_after_run:
             raise VulnScoutError('--stop-after-run cannot be used with --serve')
+
+
+def normalize_command(args: argparse.Namespace) -> None:
+    """Translate command-first arguments into the shared workflow options."""
+    action = args.action
+    parameters = args.parameters
+    if action == 'scan':
+        selection = [*args.scanners, *(part for value in parameters for part in value.split(','))]
+        if any(value not in (*SCANNERS, 'all') for value in selection):
+            raise VulnScoutError('scan types must be grype, nvd, osv, sbom-cve-check, or all')
+        args.scan_selection = (
+            'all' if not selection or 'all' in selection
+            else ','.join(value for value in SCANNERS if value in selection)
+        )
+    elif args.scanners:
+        raise VulnScoutError('scanner selection options require `west vulnscout scan`')
+    if action == 'match-condition':
+        if len(parameters) != 1 or not parameters[0].strip() or args.match_condition is not None:
+            raise VulnScoutError('match-condition requires exactly one non-empty quoted expression')
+        args.match_condition = parameters[0]
+    elif action == 'report':
+        if len(parameters) > 1 or (parameters and args.template is not None):
+            raise VulnScoutError('report accepts one template, as an argument or with --template')
+        if parameters:
+            args.template = parameters[0]
+    elif action == 'export':
+        if len(parameters) > 1 or (parameters and parameters[0] not in ('spdx', 'cdx', 'openvex')):
+            raise VulnScoutError('export accepts one kind: spdx, cdx, or openvex')
+        if parameters:
+            kind = parameters[0]
+            formats = {
+                'spdx': ('spdx3', 'spdx2'),
+                'cdx': ('cdx16', 'cdx15', 'cdx14'),
+                'openvex': ('openvex',),
+            }
+            if args.format and args.format not in formats[kind]:
+                raise VulnScoutError(f'export {kind} is incompatible with --format {args.format}')
+            args.format = args.format or formats[kind][0]
+    elif action != 'scan' and parameters:
+        raise VulnScoutError(f'{action or "add"} does not accept positional arguments')
+    if action in ('scan', 'refresh', 'match-condition', 'serve'):
+        if any((args.spdx_file, args.spdx_dir, args.no_generate, args.include_sdk,
+                args.analyze_includes, args.namespace_prefix, args.spdx_version != '3.0')):
+            raise VulnScoutError(f'{action} uses stored data and cannot accept SBOM generation/import options')
+        if args.perform_scan or args.refresh_vulnerability_data or (args.serve and action != 'serve'):
+            raise VulnScoutError(f'{action} cannot be combined with legacy workflow flags. Run separate commands.')
+        if action != 'match-condition' and args.match_condition is not None:
+            raise VulnScoutError(f'{action} cannot be combined with --match-condition')
+        if action == 'scan':
+            args.perform_scan = True
+        elif action == 'refresh':
+            args.refresh_vulnerability_data = True
+        elif action == 'serve':
+            args.serve = True
 
 
 def spdx_command(
@@ -172,12 +227,29 @@ def processing_arguments(args: argparse.Namespace, spdx_files: Sequence[str]) ->
     for path in spdx_files:
         result.extend(['--add-spdx', path])
     if args.perform_scan:
-        result.extend(['--perform-scans', 'all'])
+        result.extend(['--perform-scans', getattr(args, 'scan_selection', 'all')])
     if args.refresh_vulnerability_data:
         result.append('--refresh-vulnerability-data')
     if args.match_condition:
         result.extend(['--match-condition', args.match_condition])
     return result
+
+
+def wrapper_commands(args: argparse.Namespace, spdx_files: Sequence[str]) -> list[list[str]]:
+    scope = ['--project', args.project, '--variant', args.variant]
+    commands = []
+    if spdx_files:
+        inputs = [part for path in spdx_files for part in ('--spdx', path)]
+        commands.append(['add', *scope, *inputs])
+    if args.perform_scan:
+        commands.append(['scan', *scope, getattr(args, 'scan_selection', 'all')])
+    if args.refresh_vulnerability_data:
+        commands.append(['refresh', *scope])
+    if args.match_condition:
+        commands.append(['match-condition', *scope, args.match_condition])
+    if args.serve:
+        commands.append(['serve'])
+    return commands
 
 
 def resolve_image(args: argparse.Namespace) -> str:

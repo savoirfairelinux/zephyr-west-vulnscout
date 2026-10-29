@@ -30,7 +30,7 @@ podman inspect vulnscout \
 ```
 
 Use that host path as `--vulnscout-data-dir` when continuing the workflow.
-All direct-mode imports, refreshes, reports, and exports refuse a different
+All direct-mode data and serve commands refuse a different
 or missing cache mount. Paths resolving to the same location, including
 symlinks, are accepted. A stopped container's mount is checked before it is
 started; a running container is not modified to switch caches.
@@ -78,7 +78,7 @@ is `v0.24`. It never silently falls back to the adapter. Custom images that chan
 the standard layout must declare their actual interface rather than relying on the
 standard adapter. Existing containers are reused, not automatically upgraded.
 
-Direct-mode `--serve` starts the UI after processing and releasing the lock,
+Direct-mode `serve` starts the UI without importing or holding the lock,
 so later West imports can run while the interface remains open. These guarantees
 apply to direct West processing, not wrapper commands, API requests, or other
 native VulnScout clients. Coordinate those writers separately, and do not
@@ -92,7 +92,7 @@ export, or file-copy operation. The default is 3600 seconds; positive fractional
 values are allowed, up to 86400 seconds. Increase it for long scans:
 
 ```sh
-west vulnscout -d build --perform-scan --timeout 7200
+west vulnscout scan -d build --timeout 7200
 ```
 
 Container metadata, lifecycle cleanup, and interface queries have a 30-second
@@ -107,9 +107,10 @@ processing lock and cleaning owned inputs. The client allows an additional
 execution error, not a vulnerability-policy match, and never causes an SPDX
 version downgrade.
 
-The attached web server deliberately has no lifetime timeout. In direct mode,
-its preceding processing phase is still bounded. Wrapper `--serve` remains an
-interactive session owned by the wrapper; other wrapper invocations have a
+The attached web server deliberately has no lifetime timeout. Finite operations
+before serving remain bounded, including in legacy combined workflows.
+Wrapper `serve` remains an interactive session owned by the wrapper.
+Other wrapper invocations have a
 client deadline, but West cannot supervise wrapper-managed container jobs.
 
 ## Image selection
@@ -126,24 +127,24 @@ a locally built image. Reusing an existing container does not replace its image.
 Stop and remove the container immediately:
 
 ```sh
-west vulnscout stop --container-engine podman
+west vulnscout stop
 ```
 
-The existing `west vulnscout --stop` syntax remains supported. Both forms
-accept `--container-engine`, `--container-name`, and `--vulnscout-cmd`;
+The legacy `west vulnscout --stop` syntax remains supported with a warning.
+Both forms accept `--container-engine`, `--container-name`, and `--vulnscout-cmd`;
 neither requires a build directory. Stopping preserves host-mounted data.
 
 To stop the container after a successful one-shot import:
 
 ```sh
-west vulnscout -d demo/mbedtls_sbom/build \
-  --container-engine podman --no-generate \
+west vulnscout add -d demo/mbedtls_sbom/build \
+  --no-generate \
   --project zephyr_demo --variant mbedtls_native_sim \
   --stop-after-run
 ```
 
 `--stop-after-run` also works with refresh and report operations, but cannot
-be combined with `--serve`. Do not stop a shared container without coordinating
+be combined with `serve`. Do not stop a shared container without coordinating
 with its other users.
 
 ## Wrapper mode
@@ -151,14 +152,14 @@ with its other users.
 Use the VulnScout wrapper script instead of direct container execution:
 
 ```sh
-ZEPHYR_BASE="$PWD/zephyr" west vulnscout \
+west vulnscout serve \
   -d demo/mbedtls_sbom/build \
-  --project zephyr_demo --variant mbedtls_native_sim \
   --vulnscout-cmd /path/to/vulnscout \
   --vulnscout-image sfl:custom \
-  --serve --dev
+  --dev
 ```
 
 `--dev` is supported only in wrapper mode. The `report` and `export` actions
 require direct container mode and reject `--vulnscout-cmd`. The wrapper retains
 its own cache, input, concurrency, and interactive-mode behavior.
+An updated v0.24 wrapper is required for command-first invocations.
