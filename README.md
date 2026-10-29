@@ -3,6 +3,14 @@
 West extension command for Zephyr that generates SPDX 3 SBOMs and imports them
 into VulnScout for vulnerability analysis.
 
+Full documentation: [Read the Docs](https://zephyr-west-vulnscout.readthedocs.io/en/latest/).
+
+## VulnScout workflow
+
+The extension connects Zephyr's SPDX output to the VulnScout workflow:
+
+![VulnScout workflow: Import, Enrich, Assess, Enforce, and Share, with optional AI assistance during assessment.](https://raw.githubusercontent.com/savoirfairelinux/vulnscout/main/doc/source/_static/vulnscout-pipeline.svg)
+
 ## What it provides
 
 - `west vulnscout`
