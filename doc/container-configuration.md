@@ -51,9 +51,9 @@ This also coordinates participating containers mounting the same host cache.
 The lock file may remain after processing; its presence does not mean the lock
 is held. Do not delete it to clear a busy error.
 
-Published v0.23 images work without rebuilding VulnScout or changing its backend.
-When no `io.vulnscout.interface` label exists, West selects its built-in v0.23
-adapter only if `org.opencontainers.image.version` is exactly `v0.23`.
+Published v0.23 and v0.24 images work without rebuilding VulnScout or changing its backend.
+When no `io.vulnscout.interface` label exists, West selects its built-in compatibility
+adapter only if `org.opencontainers.image.version` is exactly `v0.23` or `v0.24`.
 The adapter centralizes that release's standard entrypoint, CLI prefix, Python
 interpreter, and `/scan` working directory. This is an explicit version dependency,
 not source-code probing or a guess based on an image tag.
@@ -74,9 +74,9 @@ podman inspect vulnscout --format '{{json .Config.Labels}}'
 West validates this metadata before staging files or starting a stopped
 container. Unknown versions without a declaration are rejected. A present but
 malformed or unsupported declaration is also rejected, even if the version label
-is `v0.23`; it never silently falls back to the adapter. Custom images that change
-the v0.23 layout must declare their actual interface rather than relying on the
-standard adapter. Existing standard v0.23 containers need no recreation.
+is `v0.23` or `v0.24`; it never silently falls back to the adapter. Custom images that change
+the standard layout must declare their actual interface rather than relying on the
+standard adapter. Existing containers are reused, not automatically upgraded.
 
 Direct-mode `--serve` starts the UI after processing and releasing the lock,
 so later West imports can run while the interface remains open. These guarantees
@@ -116,7 +116,7 @@ client deadline, but West cannot supervise wrapper-managed container jobs.
 
 `--vulnscout-image` is interpreted as `repo[:tag]`. If the tag is omitted, the
 command uses `VULNSCOUT_VERSION` (or the legacy `VULNSCOT_VERSION`), defaulting
-to `v0.23`. The default image is `docker.io/sflinux/vulnscout:v0.23`.
+to `v0.24`. The default image is `docker.io/sflinux/vulnscout:v0.24`.
 
 For example, add `--vulnscout-image sfl:custom` when creating a container from
 a locally built image. Reusing an existing container does not replace its image.

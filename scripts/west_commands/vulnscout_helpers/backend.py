@@ -35,7 +35,7 @@ V023_INTERFACE = BackendInterface(
 def resolve_interface(payload: str) -> BackendInterface:
     message = (
         'Unsupported VulnScout image metadata: use an image labeled '
-        f'{VERSION_LABEL}=v0.23 or declaring {INTERFACE_LABEL} version 1. '
+        f'{VERSION_LABEL}=v0.23/v0.24 or declaring {INTERFACE_LABEL} version 1. '
         'Image tags alone do not establish compatibility.'
     )
     try:
@@ -49,7 +49,7 @@ def resolve_interface(payload: str) -> BackendInterface:
         if not isinstance(declaration, str):
             raise VulnScoutError(f'Invalid {INTERFACE_LABEL} declaration: expected a JSON string.')
         return parse_interface(declaration)
-    if labels.get(VERSION_LABEL) == 'v0.23':
+    if labels.get(VERSION_LABEL) in ('v0.23', 'v0.24'):
         return V023_INTERFACE
     raise VulnScoutError(message)
 

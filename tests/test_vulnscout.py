@@ -1235,19 +1235,21 @@ class BackendInterfaceTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs['timeout'], 30)
 
     def test_unlabeled_v023_uses_explicit_version_adapter(self):
-        self.assertEqual(
-            backend.resolve_interface(json.dumps({backend.VERSION_LABEL: 'v0.23'})),
-            backend.BackendInterface(
-                entrypoint=('/scan/src/entrypoint.sh',),
-                cli=('flask', '--app', 'src.bin.webapp'),
-                python=('python3',), workdir='/scan',
-            ),
-        )
+        for version in ('v0.23', 'v0.24'):
+            with self.subTest(version=version):
+                self.assertEqual(
+                    backend.resolve_interface(json.dumps({backend.VERSION_LABEL: version})),
+                    backend.BackendInterface(
+                        entrypoint=('/scan/src/entrypoint.sh',),
+                        cli=('flask', '--app', 'src.bin.webapp'),
+                        python=('python3',), workdir='/scan',
+                    ),
+                )
 
     def test_unknown_or_invalid_metadata_is_not_guessed_from_tags(self):
         payloads = ['', 'null', '[]', '{}', 'not JSON']
         payloads.extend(json.dumps({backend.VERSION_LABEL: version}) for version in (
-            'v0.22', 'v0.24', 'latest', '0.23', '', None, ['v0.23'],
+            'v0.22', 'v0.25', 'latest', '0.24', '', None, ['v0.24'],
         ))
         for payload in payloads:
             with self.subTest(payload=payload), self.assertRaisesRegex(
@@ -1293,7 +1295,7 @@ class BackendInterfaceTests(unittest.TestCase):
             self.assertEqual(run.call_args_list[1].args[0], ['podman', 'start', 'isolated'])
             self.assertIs(instance.check_processing_support(), backend.V023_INTERFACE)
             self.assertEqual(run.call_count, 2)
-            info.assert_any_call('Using the built-in VulnScout v0.23 compatibility adapter')
+            info.assert_any_call('Using the built-in VulnScout v0.23/v0.24 compatibility adapter')
             ready.assert_called_once()
 
     def test_discovered_commands_and_workdir_are_used_without_scan_paths(self):

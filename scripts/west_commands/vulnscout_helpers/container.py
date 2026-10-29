@@ -222,7 +222,7 @@ class Container:
             ], 'Reading VulnScout interface contract', capture_output=True)
             self._interface = resolve_interface(result.stdout.strip())
             if self._interface is V023_INTERFACE:
-                self.info('Using the built-in VulnScout v0.23 compatibility adapter')
+                self.info('Using the built-in VulnScout v0.23/v0.24 compatibility adapter')
         return self._interface
 
     def run_processing(

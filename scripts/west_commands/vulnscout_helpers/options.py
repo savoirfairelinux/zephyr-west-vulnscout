@@ -21,7 +21,7 @@ VULNSCOUT_IMAGE_REPO = os.environ.get('VULNSCOUT_IMAGE_REPO', 'docker.io/sflinux
 VULNSCOUT_VERSION = (
     os.environ.get('VULNSCOUT_VERSION')
     or os.environ.get('VULNSCOT_VERSION')
-    or 'v0.23'
+    or 'v0.24'
 )
 DEFAULT_VULNSCOUT_IMAGE = f'{VULNSCOUT_IMAGE_REPO}:{VULNSCOUT_VERSION}'
 VULNSCOUT_ENV_FLASK_RUN_HOST = os.environ.get(
